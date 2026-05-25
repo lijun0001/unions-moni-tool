@@ -54,7 +54,7 @@ jobs:
           echo "UNIONS_EDITION=$UNIONS_EDITION"
           echo "UNIONS_EXPERIENCE_VALID=$UNIONS_EXPERIENCE_VALID"
           echo "UNIONS_BUILD_TIME_MS=$UNIONS_BUILD_TIME_MS"
-          npm run build:mac
+          npm run build:mac -- --publish never
 
       - name: Upload dmg artifact
         uses: actions/upload-artifact@v4
