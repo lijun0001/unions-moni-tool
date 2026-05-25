@@ -1,0 +1,146 @@
+{
+  "name": "unions-moni-tool",
+  "version": "1.0.0",
+  "description": "HTTP/TCP protocol simulator — Electron + Vue 3",
+  "author": "Unions",
+  "main": "dist-electron/main/index.js",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "dev:official": "cross-env UNIONS_EDITION=official vite",
+    "dev:experience": "cross-env UNIONS_EDITION=experience UNIONS_EXPERIENCE_VALID=1y vite",
+    "dev:experience:1h": "cross-env UNIONS_EDITION=experience UNIONS_EXPERIENCE_VALID=1h vite",
+    "dev:experience:1d": "cross-env UNIONS_EDITION=experience UNIONS_EXPERIENCE_VALID=1d vite",
+    "dev:experience:expired": "cross-env UNIONS_EDITION=experience UNIONS_BUILD_TIME_MS=0 vite",
+    "license:gen-key": "node scripts/gen-activation-key.mjs",
+    "build": "vue-tsc --noEmit -p tsconfig.json && vite build && cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder",
+    "build:win": "vue-tsc --noEmit -p tsconfig.json && vite build && cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --win",
+    "build:win:official": "node scripts/build-with-edition.mjs official",
+    "build:win:experience": "node scripts/build-with-edition.mjs experience",
+    "build:linux": "vue-tsc --noEmit -p tsconfig.json && vite build && cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --linux",
+    "build:linux:official": "node scripts/build-with-edition.mjs official linux",
+    "build:linux:experience": "node scripts/build-with-edition.mjs experience",
+    "build:mac": "node scripts/preflight-mac.mjs && vue-tsc --noEmit -p tsconfig.json && vite build && cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac --arm64",
+    "build:mac:official": "node scripts/build-with-edition.mjs official mac",
+    "build:mac:experience": "node scripts/build-with-edition.mjs experience mac",
+    "build:mac:official:remote": "node scripts/trigger-mac-build.mjs official",
+    "build:mac:experience:remote": "node scripts/trigger-mac-build.mjs experience",
+    "build:mac:experience:test": "node scripts/trigger-mac-build.mjs experience 1h",
+    "build:win:no-obfuscate": "vue-tsc --noEmit -p tsconfig.json && cross-env DISABLE_OBFUSCATION=1 vite build && cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --win",
+    "preview": "vite preview",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "echarts": "^6.0.0",
+    "electron-store": "^8.2.0",
+    "element-plus": "^2.8.0",
+    "exceljs": "^4.4.0",
+    "extract-zip": "^2.0.1",
+    "fs-extra": "^11.2.0",
+    "html5-qrcode": "^2.3.8",
+    "localforage": "^1.10.0",
+    "pinia": "^2.2.0",
+    "qrcode": "^1.5.4",
+    "vue": "^3.4.21",
+    "vue-router": "^4.4.0"
+  },
+  "build": {
+    "appId": "com.unions.moni.tool",
+    "productName": "Unions Moni Tool",
+    "directories": {
+      "output": "release/${version}",
+      "buildResources": "build"
+    },
+    "asar": true,
+    "files": [
+      "package.json",
+      "dist/**/*",
+      "dist-electron/**/*",
+      "!**/*.map",
+      "!**/*.md",
+      "!**/docs/**",
+      "!**/doc/**",
+      "!**/README*",
+      "!**/CHANGELOG*",
+      "!**/LICENSE*"
+    ],
+    "extraResources": [
+      {
+        "from": "plugins",
+        "to": "plugins",
+        "filter": [
+          "**/*",
+          "!**/*.md",
+          "!**/docs/**",
+          "!**/doc/**",
+          "!**/*.map"
+        ]
+      }
+    ],
+    "win": {
+      "icon": "icons/app-icon.ico",
+      "sign": null,
+      "signAndEditExecutable": false,
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "installerIcon": "icons/app-icon.ico",
+      "uninstallerIcon": "icons/app-icon.ico",
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "linux": {
+      "target": [
+        {
+          "target": "deb",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "category": "Development"
+    },
+    "mac": {
+      "icon": "icons/app-icon.png",
+      "category": "public.app-category.developer-tools",
+      "identity": null,
+      "gatekeeperAssess": false,
+      "hardenedRuntime": false,
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ]
+    },
+    "dmg": {
+      "sign": false
+    }
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.0.4",
+    "autoprefixer": "^10.4.19",
+    "cross-env": "^7.0.3",
+    "electron": "^29.1.1",
+    "electron-builder": "^24.13.3",
+    "javascript-obfuscator": "^5.4.1",
+    "postcss": "^8.4.38",
+    "tailwindcss": "^3.4.3",
+    "typescript": "^5.4.2",
+    "vite": "^5.1.5",
+    "vite-plugin-electron": "^0.28.4",
+    "vite-plugin-electron-renderer": "^0.14.5",
+    "vitest": "^4.1.4",
+    "vue-tsc": "^2.0.6"
+  }
+}

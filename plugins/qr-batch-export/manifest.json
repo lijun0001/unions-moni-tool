@@ -1,0 +1,8 @@
+{
+  "id": "qr-batch-export",
+  "name": "二维码批量生成导出",
+  "version": "1.0.0",
+  "entry": "./dist/index.mjs",
+  "permissions": [],
+  "_comment": "功能已内置在应用中，无需通过「导入功能」安装。"
+}

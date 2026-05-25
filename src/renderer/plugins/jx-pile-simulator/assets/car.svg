@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 420 160" fill="none">
+  <defs>
+    <linearGradient id="carStroke" x1="18" y1="20" x2="392" y2="132" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#39c5d7"/>
+      <stop offset="1" stop-color="#1a6e95"/>
+    </linearGradient>
+  </defs>
+  <path d="M15 120c4-4 6-10 8-16 7-25 35-34 76-34h37c20 0 30-4 42-14l12-10c15-12 31-18 52-18h57c28 0 44 5 63 16l45 24c9 5 13 11 13 20v23c0 6-5 11-11 11h-17" stroke="url(#carStroke)" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M130 56 162 32c10-8 23-12 36-12h68c13 0 26 3 38 9l34 18c6 3 4 12-3 12H133c-6 0-8-6-3-9Z" stroke="url(#carStroke)" stroke-width="4" stroke-linejoin="round"/>
+  <path d="M108 118h166" stroke="url(#carStroke)" stroke-width="5" stroke-linecap="round"/>
+  <circle cx="90" cy="118" r="30" stroke="url(#carStroke)" stroke-width="5"/>
+  <circle cx="315" cy="118" r="30" stroke="url(#carStroke)" stroke-width="5"/>
+</svg>

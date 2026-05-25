@@ -1,0 +1,8 @@
+{
+  "id": "cec-inner-link",
+  "name": "充电互联互通（内互联）模拟",
+  "version": "1.0.0",
+  "entry": "./dist/index.mjs",
+  "permissions": ["network"],
+  "_comment": "此为占位清单。功能已内置在应用中，无需通过「导入功能」安装；若导入本目录会因缺少 dist/index.mjs 而失败。"
+}

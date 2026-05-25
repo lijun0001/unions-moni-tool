@@ -1,0 +1,87 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+  --um-brand: oklch(0.72 0.14 195);
+  --um-brand-muted: oklch(0.55 0.08 195);
+  --um-bg: oklch(0.16 0.02 250);
+  --um-surface: oklch(0.2 0.025 250);
+  --um-surface-2: oklch(0.24 0.03 250);
+  --um-border: oklch(0.38 0.04 250);
+  --um-text: oklch(0.93 0.02 250);
+  --um-text-muted: oklch(0.72 0.03 250);
+  --um-radius: 12px;
+  --space-xs: 4px;
+  --space-sm: 8px;
+  --space-md: 12px;
+  --space-lg: 16px;
+  --space-xl: 24px;
+  --space-2xl: 32px;
+  --um-scrollbar-track: oklch(0.24 0.02 250);
+  --um-scrollbar-thumb: oklch(0.58 0.03 250);
+  --um-scrollbar-thumb-hover: oklch(0.68 0.035 250);
+}
+
+:root:not(.dark) {
+  color-scheme: light;
+  --um-brand: oklch(0.52 0.12 195);
+  --um-brand-muted: oklch(0.45 0.08 195);
+  --um-bg: oklch(0.98 0.01 250);
+  --um-surface: oklch(1 0.005 250);
+  --um-surface-2: oklch(0.96 0.015 250);
+  --um-border: oklch(0.88 0.02 250);
+  --um-text: oklch(0.22 0.03 250);
+  --um-text-muted: oklch(0.45 0.03 250);
+  --um-scrollbar-track: oklch(0.9 0.01 250);
+  --um-scrollbar-thumb: oklch(0.72 0.02 250);
+  --um-scrollbar-thumb-hover: oklch(0.62 0.03 250);
+}
+
+html {
+  font-family: Manrope, ui-sans-serif, system-ui, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+}
+
+html.dark {
+  line-height: 1.62;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--um-bg);
+  color: var(--um-text);
+}
+
+/* 宿主产品滚动条：深色细轨道 + 圆角滑块（参考设计图） */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--um-scrollbar-thumb) var(--um-scrollbar-track);
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-track {
+  background: var(--um-scrollbar-track);
+  border-radius: 999px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--um-scrollbar-thumb);
+  border-radius: 999px;
+  border: 2px solid var(--um-scrollbar-track);
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--um-scrollbar-thumb-hover);
+}
+
+.um-display {
+  font-family: Lexend, ui-sans-serif, system-ui, sans-serif;
+}

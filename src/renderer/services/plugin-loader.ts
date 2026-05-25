@@ -1,0 +1,48 @@
+import { markRaw } from 'vue'
+import type { Component } from 'vue'
+import type { InstalledPluginRecord, ProtocolSimulatorPlugin } from '@shared/plugin-contract'
+import * as CecInnerLink from '@renderer/plugins/cec-inner-link/index'
+import * as JxPileSimulator from '@renderer/plugins/jx-pile-simulator/index'
+import * as QrBatchExport from '@renderer/plugins/qr-batch-export/index'
+
+/** 从 file:// 入口加载 ESM；插件应使用 globalThis.__UNIONS_VUE__ 引用 Vue */
+export async function loadPluginModule(
+  record: InstalledPluginRecord,
+): Promise<ProtocolSimulatorPlugin> {
+  /** 内置插件必须静态导入，避免生产包内动态 import 分块路径在 Electron file 协议下解析失败 */
+  if (record.id === 'cec-inner-link') {
+    return {
+      meta: CecInnerLink.meta,
+      homeCard: CecInnerLink.homeCard,
+      MainView: CecInnerLink.MainView,
+    }
+  }
+  if (record.id === 'jx-pile-simulator') {
+    return {
+      meta: JxPileSimulator.meta,
+      homeCard: JxPileSimulator.homeCard,
+      MainView: JxPileSimulator.MainView,
+    }
+  }
+  if (record.id === 'qr-batch-export') {
+    return {
+      meta: QrBatchExport.meta,
+      homeCard: QrBatchExport.homeCard,
+      MainView: QrBatchExport.MainView,
+    }
+  }
+  const href = window.unions.resolvePluginEntryUrl(record)
+  const mod = (await import(/* @vite-ignore */ href)) as Record<string, unknown>
+  const meta = mod.meta
+  const homeCard = mod.homeCard
+  const MainView = mod.MainView
+  if (!meta || !homeCard || !MainView) {
+    throw new Error(`插件 ${record.id} 缺少 meta / homeCard / MainView 导出`)
+  }
+  return {
+    meta: meta as ProtocolSimulatorPlugin['meta'],
+    homeCard: homeCard as ProtocolSimulatorPlugin['homeCard'],
+    MainView: markRaw(MainView as Component) as ProtocolSimulatorPlugin['MainView'],
+    SettingsView: mod.SettingsView as ProtocolSimulatorPlugin['SettingsView'],
+  }
+}

@@ -1,0 +1,66 @@
+# 在 macOS runner 上构建 Apple Silicon (arm64) .dmg
+# Windows 上请用: npm run build:mac:experience:remote -- 1h
+
+name: Build macOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      edition:
+        description: official 或 experience
+        required: true
+        default: experience
+        type: choice
+        options:
+          - official
+          - experience
+      experience_valid:
+        description: 体验版有效期，如 1h / 7d / 1y
+        required: false
+        default: 1y
+      disable_obfuscation:
+        description: 测试包建议关闭混淆以加快构建
+        required: true
+        default: '1'
+        type: choice
+        options:
+          - '1'
+          - '0'
+
+jobs:
+  build-mac:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build macOS dmg (arm64)
+        env:
+          UNIONS_EDITION: ${{ inputs.edition }}
+          UNIONS_EXPERIENCE_VALID: ${{ inputs.experience_valid }}
+          DISABLE_OBFUSCATION: ${{ inputs.disable_obfuscation == '1' && '1' || '' }}
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: |
+          export UNIONS_BUILD_TIME_MS="$(node -e "console.log(Date.now())")"
+          echo "UNIONS_EDITION=$UNIONS_EDITION"
+          echo "UNIONS_EXPERIENCE_VALID=$UNIONS_EXPERIENCE_VALID"
+          echo "UNIONS_BUILD_TIME_MS=$UNIONS_BUILD_TIME_MS"
+          npm run build:mac
+
+      - name: Upload dmg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-${{ inputs.edition }}-${{ inputs.experience_valid }}
+          path: |
+            release/**/*.dmg
+            release/**/*.zip
+          if-no-files-found: error
