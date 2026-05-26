@@ -1,14 +1,17 @@
 <script setup lang="ts">
 import { computed, markRaw, shallowRef, toRaw, watch } from 'vue'
 import type { Component } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { useRouter } from 'vue-router'
 import { usePluginStore } from '@renderer/stores/plugins'
 
-const route = useRoute()
+const props = defineProps<{ pluginId: string }>()
+
+defineOptions({ name: 'PluginView' })
+
 const router = useRouter()
 const plugins = usePluginStore()
 
-const pluginId = computed(() => String(route.params.pluginId))
+const pluginId = computed(() => props.pluginId.trim())
 
 const entry = computed(() => plugins.byId.get(pluginId.value))
 

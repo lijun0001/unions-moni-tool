@@ -1,6 +1,6 @@
 import { createRouter, createWebHashHistory } from 'vue-router'
 import HomeView from '@renderer/views/HomeView.vue'
-import PluginView from '@renderer/views/PluginView.vue'
+import PluginRoutePlaceholder from '@renderer/views/PluginRoutePlaceholder.vue'
 import ImportView from '@renderer/views/ImportView.vue'
 import AboutView from '@renderer/views/AboutView.vue'
 import LicenseView from '@renderer/views/LicenseView.vue'
@@ -13,7 +13,7 @@ export const router = createRouter({
     {
       path: '/plugin/:pluginId',
       name: 'plugin',
-      component: PluginView,
+      component: PluginRoutePlaceholder,
     },
     {
       path: '/settings/import',

@@ -61,7 +61,14 @@ type RemoteStartRuntimeConfig = {
   stopAmountThreshold: number
 }
 
+export type ScanQrVinStartRuntimeConfig = {
+  /** 勾选后强制回复 0x5B 失败，订单标记启动失败并结束流程 */
+  simulate5bFail: boolean
+  reply5bFailReason: number
+}
+
 const remoteStartConfigByPile = new Map<string, RemoteStartRuntimeConfig>()
+const scanQrVinStartConfigByPile = new Map<string, ScanQrVinStartRuntimeConfig>()
 
 function fakeHex(cmd: string, direction: 'send' | 'receive'): string {
   const dir = direction === 'send' ? 'AA55' : '55AA'
@@ -386,6 +393,36 @@ export function buildVinAuth40Payload(pile: JxTopologyPile, gunId: string, vin: 
   const v = vin.trim().toUpperCase().slice(0, 17)
   const ord = orderNo.trim().slice(0, 32)
   return `${makeTimeTag6Hex()}${asciiFixedHex(v, 17)}${gunHex}${asciiFixedHex(ord, 32)}`
+}
+
+/** 下行 `0x59`（表 3.9.30）：时间标识(6)+枪号(1)+充电订单号(32)，共 39 字节。 */
+export function parseVinStart59Payload(dataHexRaw: string): {
+  timeTag: string
+  gunNo: number
+  orderNo: string
+} | null {
+  const dataHex = (dataHexRaw || '').replace(/[^0-9a-f]/gi, '').toLowerCase()
+  if (dataHex.length < 78) return null
+  const orderNo = parseAsciiFixed(dataHex.slice(14, 78)).trim()
+  if (!orderNo) return null
+  return {
+    timeTag: decodeTimeTag6(dataHex.slice(0, 12)),
+    gunNo: Number.parseInt(dataHex.slice(12, 14), 16),
+    orderNo,
+  }
+}
+
+/** 上行 `0x5B`（表 3.9.31）：时间标识(6)+枪号(1)+充电订单号(32)+结果(1)+失败原因(1)，共 41 字节。 */
+export function buildVinStart5bPayload(
+  gunNoHex: string,
+  orderNo: string,
+  result: 1 | 2,
+  failReason: number,
+): string {
+  const gun = (gunNoHex || '00').replace(/[^0-9a-f]/gi, '').toLowerCase().padStart(2, '0').slice(0, 2)
+  const resHex = Math.max(1, Math.min(2, result)).toString(16).padStart(2, '0')
+  const failHex = Math.max(0, Math.min(255, Math.trunc(failReason))).toString(16).padStart(2, '0')
+  return `${makeTimeTag6Hex()}${gun}${asciiFixedHex(orderNo.trim().slice(0, 32), 32)}${resHex}${failHex}`
 }
 
 /**
@@ -729,6 +766,24 @@ export function decodeCmdPayload(cmd: string, dataHexRaw: string, protocolId?: s
     out.vin = parseAsciiFixed(vin)
     out.gunNo = gunNo ? Number.parseInt(gunNo, 16) : null
     out.orderNo = parseAsciiFixed(orderNo)
+  } else if (c === '0x59') {
+    const timeTag = take('timeTag', 6)
+    const gunNo = take('gunNo', 1)
+    const orderNo = take('orderNo', 32)
+    out.timeTag = decodeTimeTag6(timeTag)
+    out.gunNo = gunNo ? Number.parseInt(gunNo, 16) : null
+    out.orderNo = parseAsciiFixed(orderNo)
+  } else if (c === '0x5b') {
+    const timeTag = take('timeTag', 6)
+    const gunNo = take('gunNo', 1)
+    const orderNo = take('orderNo', 32)
+    const result = take('result', 1)
+    const failReason = take('failReason', 1)
+    out.timeTag = decodeTimeTag6(timeTag)
+    out.gunNo = gunNo ? Number.parseInt(gunNo, 16) : null
+    out.orderNo = parseAsciiFixed(orderNo)
+    out.result = result ? Number.parseInt(result, 16) : null
+    out.failReason = failReason ? Number.parseInt(failReason, 16) : null
   } else if (c === '0x41') {
     const timeTag = take('timeTag', 6)
     const vin = take('vin', 17)
@@ -1427,7 +1482,7 @@ function makeLoginPayload(
   )
 }
 
-function ensureTcpEventListener() {
+export function ensureTcpEventListener() {
   if (tcpEventBound) return
   // 处理 HMR/重复装载场景：先移除旧监听，避免同一帧被多次处理
   if (unbindTcpEvent) {
@@ -1604,6 +1659,120 @@ function ensureTcpEventListener() {
               },
             })
           })
+      }
+
+      if (normalizeCmd(cmd) === '0x59' && pile) {
+        const body = (dataHex || '').replace(/[^0-9a-f]/gi, '').toLowerCase()
+        const parsed59 = parseVinStart59Payload(body)
+        const gunNoHex =
+          parsed59 && Number.isFinite(parsed59.gunNo)
+            ? Math.max(0, Math.min(255, parsed59.gunNo)).toString(16).padStart(2, '0')
+            : body.slice(12, 14).padStart(2, '0').slice(0, 2) || '00'
+        const orderNo = parsed59?.orderNo?.trim() ?? ''
+        const gunId = gunHexToGunId(pile, gunNoHex)
+        const gun = gunId ? pile.guns.find((g) => g.gunId === gunId) : null
+        const vin = String(gun?.vin ?? '').trim().toUpperCase()
+        const cfg59 = scanQrVinConfigForPile(pileId)
+        const business5b = evaluateScanQrVinBusinessChecks(pile, gun, vin)
+        const reply5b = resolveScanQrVin5bReply(cfg59, business5b)
+
+        if (parsed59 && orderNo) {
+          const tariffSnapshot = tariffSnapshotForNewOrder(pile, null, false)
+          const order: JxPileOrder = {
+            orderNo,
+            pileId,
+            gunId: gunId ?? pile.guns[0]?.gunId ?? 'A',
+            startAuthSource: '0x59-scan-vin',
+            startType: 'immediate',
+            startParam: '扫码VIN启动',
+            startAt: Date.now(),
+            status: 'created',
+            tariffSnapshot,
+            request23: {
+              vin: vin || undefined,
+              userType: 6,
+              userId: vin,
+              controlMode: 4,
+              controlParam: 0,
+              chargeMode: 1,
+              startMode: 1,
+              billingModelSelect: 1,
+              billingModelSelect1f: 1,
+              tariffModelVersionAtStart: tariffSnapshot.version,
+            },
+            process25: [],
+            process30: [],
+          }
+          orderStore.upsertOrder(order)
+        }
+
+        const payload5b = buildVinStart5bPayload(gunNoHex, orderNo || 'UNKNOWN', reply5b.result, reply5b.reason)
+        void tcpInvoke('send', { pileId, cmd: '0x5b', pileNo: pile.pileId, dataHex: payload5b, timeoutMs: 5000 })
+          .then((ret5b) => {
+            logs.appendLog(pileId, {
+              t: Date.now(),
+              pileId,
+              command: '0x5b',
+              direction: 'send',
+              remoteIp: remote,
+              rawHex: toHexPairs(String(ret5b.requestFrameHex ?? '')),
+              structured: {
+                type: 'scan-qr-vin-start-reply',
+                triggerCmd: '0x59',
+                requestDataHex: payload5b,
+                decoded: decodeCmdPayload('0x5b', payload5b),
+                ok: ret5b.ok === true,
+              },
+            })
+          })
+          .catch(() => {})
+
+        if (!parsed59 || !orderNo) {
+          logs.appendLog(pileId, {
+            t: Date.now(),
+            pileId,
+            command: '0x59',
+            direction: 'receive',
+            remoteIp: remote,
+            rawHex: toHexPairs(String(evt.frameHex ?? '')),
+            structured: {
+              type: 'scan-qr-vin-start-request',
+              responseDataHex: body,
+              ok: false,
+              error: '0x59 报文解析失败或订单号为空',
+            },
+          })
+          return
+        }
+
+        logs.appendLog(pileId, {
+          t: Date.now(),
+          pileId,
+          command: '0x59',
+          direction: 'receive',
+          remoteIp: remote,
+          rawHex: toHexPairs(String(evt.frameHex ?? '')),
+          structured: {
+            type: 'scan-qr-vin-start-request',
+            responseDataHex: body,
+            decoded: decodeCmdPayload('0x59', body),
+            ok: true,
+          },
+        })
+
+        if (reply5b.result === 2) {
+          orderStore.updateOrderStatus(pileId, orderNo, {
+            status: 'failed',
+            failReasonCode: reply5b.reason,
+            failReasonText: failReasonText(reply5b.reason),
+          })
+          return
+        }
+
+        orderStore.updateOrderStatus(pileId, orderNo, { status: 'start-accepted' })
+        if (gun && gunId) {
+          void runScanQrVinAuthContinuation(pileId, gunId, orderNo, vin)
+        }
       }
 
       if (normalizeCmd(cmd) === '0x1f' && pile) {
@@ -2025,6 +2194,7 @@ export function disposeJxPileRuntime(pileId: string): void {
   loginPending03State.delete(pileId)
   pendingStartAck.delete(pileId)
   remoteStartConfigByPile.delete(pileId)
+  scanQrVinStartConfigByPile.delete(pileId)
 }
 
 /**
@@ -2303,6 +2473,209 @@ export function setRemoteStartConfig(pileId: string, config: RemoteStartRuntimeC
   remoteStartConfigByPile.set(pileId, config)
 }
 
+function scanQrVinConfigForPile(pileId: string): ScanQrVinStartRuntimeConfig {
+  return (
+    scanQrVinStartConfigByPile.get(pileId) ?? {
+      simulate5bFail: false,
+      reply5bFailReason: 6,
+    }
+  )
+}
+
+export function setScanQrVinStartConfig(pileId: string, config: ScanQrVinStartRuntimeConfig): void {
+  scanQrVinStartConfigByPile.set(pileId, config)
+}
+
+function resolveScanQrVin5bReply(
+  cfg: ScanQrVinStartRuntimeConfig,
+  business: { result: 1 | 2; reason: number },
+): { result: 1 | 2; reason: number } {
+  if (cfg.simulate5bFail) {
+    return { result: 2, reason: Math.max(1, Math.min(255, cfg.reply5bFailReason || 6)) }
+  }
+  return business
+}
+
+function evaluateScanQrVinBusinessChecks(
+  pile: JxTopologyPile,
+  gun: JxTopologyPile['guns'][number] | null | undefined,
+  vin: string,
+): { result: 1 | 2; reason: number } {
+  if (pile.onlineState !== 'online') return { result: 2, reason: 1 }
+  if (!gun) return { result: 2, reason: 5 }
+  if (gun.status === 'charging' || gun.status === 'occupied') return { result: 2, reason: 2 }
+  if (gun.status !== 'linked') return { result: 2, reason: 6 }
+  if (vin.length < 8) return { result: 2, reason: 6 }
+  return { result: 1, reason: 0 }
+}
+
+function dispatchVinAuth21After41(
+  pile: JxTopologyPile,
+  pileId: string,
+  gunId: string,
+  orderNo: string,
+  authOk: boolean,
+  parsed41: NonNullable<ReturnType<typeof parseVinAuth41Payload>>,
+  remote: string,
+): void {
+  const orderStore = useJxOrderStore()
+  const logs = useJxRuntimeLogStore()
+  const cfg = remoteConfigForPile(pileId)
+  const gunNoHex = gunIdToGunNoHex(pile, gunId)
+  const startResult21: 1 | 2 = authOk ? cfg.startResult : 2
+  const failReason21 = authOk ? cfg.failReason : Math.min(Math.max(parsed41.prohibitReason, 0), 255)
+
+  setTimeout(() => {
+    const od = orderStore.listByPile(pileId).find((x) => x.orderNo === orderNo)
+    const payload21 = make21Payload(pile, od, gunNoHex || '00', startResult21, failReason21)
+    void tcpInvoke('send', { pileId, cmd: '0x21', pileNo: pile.pileId, dataHex: payload21, timeoutMs: 5000 })
+      .then((r21) => {
+        logs.appendLog(pileId, {
+          t: Date.now(),
+          pileId,
+          command: '0x21',
+          direction: 'send',
+          remoteIp: remote,
+          rawHex: toHexPairs(String(r21.requestFrameHex ?? '')),
+          structured: {
+            type: 'vin-auth-start-result',
+            requestDataHex: payload21,
+            decoded: decodeCmdPayload('0x21', payload21, pile.protocolId),
+            ok: r21.ok === true,
+          },
+        })
+        pendingStartAck.set(`${pileId}:${gunId}`, { orderNo, gunId, startResult: startResult21 })
+        if (!authOk) {
+          orderStore.updateOrderStatus(pileId, orderNo, {
+            status: 'failed',
+            failReasonCode: parsed41.prohibitReason,
+            failReasonText: vinAuthProhibitReasonText(parsed41.prohibitReason),
+          })
+        } else if (startResult21 === 2) {
+          orderStore.updateOrderStatus(pileId, orderNo, {
+            status: 'failed',
+            failReasonCode: cfg.failReason,
+            failReasonText: failReasonText(cfg.failReason),
+          })
+        } else {
+          orderStore.updateOrderStatus(pileId, orderNo, { status: 'starting' })
+        }
+      })
+      .catch(() => {})
+  }, 2000)
+}
+
+/**
+ * 扫码 VIN 启动：在 `0x59`/`0x5B` 成功后继续发送 `0x40`（带订单号）并等待 `0x41`，随后与 VIN 启动一致进入 `0x21`。
+ */
+async function runScanQrVinAuthContinuation(
+  pileId: string,
+  gunId: string,
+  orderNo: string,
+  vin: string,
+): Promise<void> {
+  const topo = useJxTopologyStore()
+  const orderStore = useJxOrderStore()
+  const logs = useJxRuntimeLogStore()
+  const pile = topo.piles.find((x) => x.pileId === pileId)
+  if (!pile) return
+
+  const remote = `${pile.tcpHost ?? '127.0.0.1'}:${pile.tcpPort ?? 9000}`
+  const payload40 = buildVinAuth40Payload(pile, gunId, vin, orderNo)
+  const ret = await tcpInvoke('send', {
+    pileId,
+    cmd: '0x40',
+    pileNo: pile.pileId,
+    dataHex: payload40,
+    expectCmds: ['0x41'],
+    timeoutMs: 15000,
+  })
+  logs.appendLog(pileId, {
+    t: Date.now(),
+    pileId,
+    command: '0x40',
+    direction: 'send',
+    remoteIp: remote,
+    rawHex: toHexPairs(String(ret.requestFrameHex ?? '')),
+    structured: {
+      type: 'scan-qr-vin-auth-request',
+      requestDataHex: payload40,
+      decoded: decodeCmdPayload('0x40', payload40),
+      ok: ret.ok === true,
+      error: ret.ok === true ? undefined : String(ret.error ?? ''),
+    },
+  })
+  if (!isOk(ret)) {
+    orderStore.updateOrderStatus(pileId, orderNo, {
+      status: 'failed',
+      failReasonText: String(ret.error ?? '等待 0x41 超时或发送失败'),
+    })
+    return
+  }
+
+  const body = String(ret.dataHex ?? '').replace(/[^0-9a-f]/gi, '').toLowerCase()
+  const parsed = parseVinAuth41Payload(body)
+  logs.appendLog(pileId, {
+    t: Date.now(),
+    pileId,
+    command: '0x41',
+    direction: 'receive',
+    remoteIp: remote,
+    rawHex: toHexPairs(String(ret.frameHex ?? '')),
+    structured: {
+      type: 'scan-qr-vin-auth-reply',
+      responseDataHex: body,
+      decoded: parsed ? decodeCmdPayload('0x41', body) : { parseError: 'invalid 0x41' },
+      ok: parsed !== null,
+    },
+  })
+  if (!parsed) {
+    orderStore.updateOrderStatus(pileId, orderNo, {
+      status: 'failed',
+      failReasonText: '0x41 报文解析失败',
+    })
+    return
+  }
+
+  const authOk = parsed.allowChargeFlag === 1
+  const cfg = remoteConfigForPile(pileId)
+  const excludeFromOrderPush = !authOk || cfg.startResult === 2
+  const tariffSnapshot = tariffSnapshotForVin41Order(pile, parsed.embeddedTariffModel, parsed.billingModelSelect)
+
+  const existing = orderStore.listByPile(pileId).find((x) => x.orderNo === orderNo)
+  orderStore.upsertOrder({
+    orderNo,
+    pileId,
+    gunId,
+    startAuthSource: '0x59-scan-vin',
+    startType: 'immediate',
+    startParam: `扫码VIN billing=${parsed.billingModelSelect}`,
+    startAt: existing?.startAt ?? Date.now(),
+    status: authOk ? 'start-accepted' : 'failed',
+    failReasonCode: authOk ? undefined : parsed.prohibitReason,
+    failReasonText: authOk ? undefined : vinAuthProhibitReasonText(parsed.prohibitReason),
+    excludeFromOrderPush,
+    tariffSnapshot,
+    request23: {
+      vin: parsed.vin || vin,
+      userType: 6,
+      userId: vin,
+      controlMode: 4,
+      controlParam: 0,
+      chargeMode: 1,
+      startMode: 1,
+      billingModelSelect: parsed.billingModelSelect,
+      billingModelSelect1f: parsed.billingModelSelect,
+      accountBalanceFen: parsed.accountBalanceFen,
+      tariffModelVersionAtStart: tariffSnapshot.version,
+    },
+    process25: [],
+    process30: [],
+  })
+
+  dispatchVinAuth21After41(pile, pileId, gunId, orderNo, authOk, parsed, remote)
+}
+
 export function forceStopOrderCharging(
   pileId: string,
   orderNo: string,
@@ -2434,48 +2807,7 @@ export async function runVinAuthRemoteStart(pileId: string, gunId: string): Prom
   }
   orderStore.upsertOrder(baseOrder)
 
-  const gunNoHex = gunIdToGunNoHex(pile, gunId)
-  const startResult21: 1 | 2 = authOk ? cfg.startResult : 2
-  const failReason21 = authOk ? cfg.failReason : Math.min(Math.max(parsed.prohibitReason, 0), 255)
-
-  setTimeout(() => {
-    const od = orderStore.listByPile(pileId).find((x) => x.orderNo === orderNo)
-    const payload21 = make21Payload(pile, od, gunNoHex || '00', startResult21, failReason21)
-    void tcpInvoke('send', { pileId, cmd: '0x21', pileNo: pile.pileId, dataHex: payload21, timeoutMs: 5000 })
-      .then((r21) => {
-        logs.appendLog(pileId, {
-          t: Date.now(),
-          pileId,
-          command: '0x21',
-          direction: 'send',
-          remoteIp: remote,
-          rawHex: toHexPairs(String(r21.requestFrameHex ?? '')),
-          structured: {
-            type: 'vin-auth-start-result',
-            requestDataHex: payload21,
-            decoded: decodeCmdPayload('0x21', payload21, pile.protocolId),
-            ok: r21.ok === true,
-          },
-        })
-        pendingStartAck.set(`${pileId}:${gunId}`, { orderNo, gunId, startResult: startResult21 })
-        if (!authOk) {
-          orderStore.updateOrderStatus(pileId, orderNo, {
-            status: 'failed',
-            failReasonCode: parsed.prohibitReason,
-            failReasonText: vinAuthProhibitReasonText(parsed.prohibitReason),
-          })
-        } else if (startResult21 === 2) {
-          orderStore.updateOrderStatus(pileId, orderNo, {
-            status: 'failed',
-            failReasonCode: cfg.failReason,
-            failReasonText: failReasonText(cfg.failReason),
-          })
-        } else {
-          orderStore.updateOrderStatus(pileId, orderNo, { status: 'starting' })
-        }
-      })
-      .catch(() => {})
-  }, 2000)
+  dispatchVinAuth21After41(pile, pileId, gunId, orderNo, authOk, parsed, remote)
 
   if (!authOk) {
     return { ok: false, error: `鉴权未通过：${vinAuthProhibitReasonText(parsed.prohibitReason)}` }
@@ -2532,11 +2864,7 @@ export async function executeFlow(payload: ExecuteFlowPayload): Promise<{ ok: bo
       allowTimeoutCount: hbTimeoutLimit,
     })
 
-    const status = (await tcpInvoke('status', { pileId: payload.pileId })) as TcpStatusResult
-    if (status.ok !== true || status.connected !== true) {
-      // 关闭/断开态下，主动丢弃旧会话，确保后续一定是新建 TCP 连接
-      await tcpInvoke('disconnect', { pileId: payload.pileId })
-    }
+    await tcpInvoke('disconnect', { pileId: payload.pileId })
 
     const conn = await tcpInvoke('connect', {
       pileId: payload.pileId,

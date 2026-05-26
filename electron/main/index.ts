@@ -155,6 +155,7 @@ async function installPluginFromPath(sourcePath: string): Promise<InstalledPlugi
 }
 
 let win: BrowserWindow | null = null
+let isQuitting = false
 const preload = path.join(__dirname, '../preload/index.mjs')
 const indexHtml = path.join(RENDERER_DIST, 'index.html')
 const appIconPng = path.join(process.env.APP_ROOT, 'build/icons/app-icon.png')
@@ -401,6 +402,13 @@ async function createWindow() {
   win.webContents.setWindowOpenHandler(({ url }) => {
     if (url.startsWith('https:') || url.startsWith('http:')) shell.openExternal(url)
     return { action: 'deny' }
+  })
+
+  win.on('close', (event) => {
+    if (process.platform !== 'darwin') return
+    if (isQuitting) return
+    event.preventDefault()
+    win?.hide()
   })
 
   setCecLogNotifier((entry) => {
@@ -783,6 +791,10 @@ app.on('window-all-closed', () => {
 })
 
 app.on('activate', () => {
+  if (win) {
+    win.show()
+    return
+  }
   if (BrowserWindow.getAllWindows().length === 0) void createWindow()
 })
 
@@ -794,5 +806,6 @@ app.on('second-instance', () => {
 })
 
 app.on('before-quit', () => {
+  isQuitting = true
   closeAllJxSessions()
 })

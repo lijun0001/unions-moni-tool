@@ -171,7 +171,7 @@ export interface JxPileOrder {
   pileId: string
   gunId: string
   /** 启动鉴权来源，决定上行 `0x21` 中用户类型与用户ID（见协议表1.8及手册工程约定） */
-  startAuthSource?: '0x19-card' | '0x40-vin' | '0x1f-remote'
+  startAuthSource?: '0x19-card' | '0x40-vin' | '0x59-scan-vin' | '0x1f-remote'
   startType: 'immediate' | 'scheduled'
   startParam: string
   startAt: number

@@ -2,19 +2,20 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { usePluginStore } from '@renderer/stores/plugins'
+import { usePluginWindowStore } from '@renderer/stores/pluginWindow'
 import { useThemeStore } from '@renderer/stores/theme'
 import { useLicenseStore } from '@renderer/stores/license'
 
 const router = useRouter()
 const route = useRoute()
 const plugins = usePluginStore()
+const pluginWindow = usePluginWindowStore()
 const theme = useThemeStore()
 const license = useLicenseStore()
 
 const open = ref(false)
 const expanded = ref<'home' | 'settings' | 'help' | null>(null)
 const hoverMenu = ref(false)
-const openedPluginIds = ref<string[]>([])
 
 const pluginLinks = computed(() =>
   plugins.items.map((p) => ({
@@ -25,7 +26,7 @@ const pluginLinks = computed(() =>
 )
 
 const openedPluginCards = computed(() =>
-  openedPluginIds.value.map((id) => {
+  pluginWindow.openedIds.map((id) => {
     const hit = plugins.byId.get(id)
     return {
       id,
@@ -46,10 +47,10 @@ async function go(path: string) {
 }
 
 function closeOpenedPlugin(id: string) {
-  openedPluginIds.value = openedPluginIds.value.filter((x) => x !== id)
   if (route.name === 'plugin' && String(route.params.pluginId ?? '') === id) {
     router.push('/')
   }
+  pluginWindow.close(id)
 }
 
 async function goOpenedPlugin(id: string) {
@@ -75,9 +76,10 @@ watch(
     if (route.name === 'plugin') {
       const id = String(route.params.pluginId ?? '').trim()
       if (!id) return
-      openedPluginIds.value = [id, ...openedPluginIds.value.filter((x) => x !== id)]
+      pluginWindow.markOpened(id)
     }
   },
+  { immediate: true },
 )
 </script>
 
@@ -108,10 +110,7 @@ watch(
           ≡
         </button>
         <Transition name="um-fade">
-          <div
-            v-if="hoverMenu && openedPluginCards.length > 0"
-            class="absolute left-[calc(100%+10px)] top-0 z-[5001] w-[min(56vw,340px)] rounded-[var(--um-radius)] border border-[var(--um-border)] bg-[var(--um-surface)] p-2 shadow-xl"
-          >
+          <div v-if="hoverMenu && openedPluginCards.length > 0" class="absolute left-[calc(100%+10px)] top-0 z-[5001] w-[min(56vw,340px)] rounded-[var(--um-radius)] border border-[var(--um-border)] bg-[var(--um-surface)] p-2 shadow-xl">
             <div class="mb-1 px-1 text-xs text-[var(--um-text-muted)]">已打开插件</div>
             <div class="max-h-[300px] space-y-1 overflow-auto">
               <div

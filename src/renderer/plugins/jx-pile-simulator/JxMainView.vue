@@ -8,14 +8,17 @@ import { useJxTopologyStore } from './useJxTopologyStore'
 import { useJxRuntimeLogStore } from './useJxRuntimeLogStore'
 import {
   executeFlow,
+  ensureTcpEventListener,
   forceStopOrderCharging,
   pushTeleSignalOnStateChange,
   resetJxPileSessionOnDisconnect,
   runVinAuthRemoteStart,
   setRemoteStartConfig,
+  setScanQrVinStartConfig,
 } from './protocol-executor'
 import { getDisconnectBlockReason } from './disconnect-guard'
 import { useJxOrderStore } from './useJxOrderStore'
+import { usePluginWindowStore } from '@renderer/stores/pluginWindow'
 import type { JxPileOrder } from './types'
 import chargePileSvg from './assets/charge-pile.svg'
 import carSvg from './assets/car.svg'
@@ -24,6 +27,9 @@ const protocolStore = useJxProtocolStore()
 const topologyStore = useJxTopologyStore()
 const logStore = useJxRuntimeLogStore()
 const orderStore = useJxOrderStore()
+const pluginWindow = usePluginWindowStore()
+
+const PLUGIN_ID = 'jx-pile-simulator'
 
 const drawerTab = ref<'basic' | 'control' | 'orders' | 'logs'>('basic')
 const selectedFlowId = ref<string>('')
@@ -68,6 +74,11 @@ const remoteStartConfig = ref({
   failReason: 0,
   chargeModelId: 'builtin-default',
   stopAmountThreshold: 0,
+})
+
+const scanQrVinStartConfig = ref({
+  simulate5bFail: false,
+  reply5bFailReason: 6,
 })
 
 const orderKeyword = ref('')
@@ -226,8 +237,6 @@ function closeDrawer() {
 }
 
 onMounted(() => {
-  // 首次进入页面不自动展开桩信息抽屉，由用户点击桩后再展示
-  topologyStore.activePileId = null
   filterProtocol.value = protocolStore.activeProtocolId
   if (!selectedFlowId.value && protocolStore.activeProtocol.flowTemplates[0]) {
     selectedFlowId.value = protocolStore.activeProtocol.flowTemplates[0].flowId
@@ -238,7 +247,8 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
-  // 关闭插件视图时，统一断开所有桩的 TCP 连接，避免遗留长连接
+  // 切换路由时插件仍保留在窗口缓存中，不断开 TCP；仅菜单关闭或应用退出时清理
+  if (pluginWindow.isOpen(PLUGIN_ID)) return
   for (const pile of topologyStore.piles) {
     void window.unions.jxTcpInvoke('disconnect', { pileId: pile.pileId })
   }
@@ -311,6 +321,7 @@ watch(
       protocolId: pile.protocolId,
     }
     setRemoteStartConfig(pile.pileId, remoteStartConfig.value)
+    setScanQrVinStartConfig(pile.pileId, scanQrVinStartConfig.value)
   },
   { immediate: true },
 )
@@ -321,6 +332,15 @@ watch(
     if (cfg.startResult === 1) cfg.failReason = 0
     if (!topologyStore.activePileId) return
     setRemoteStartConfig(topologyStore.activePileId, cfg)
+  },
+  { deep: true },
+)
+
+watch(
+  scanQrVinStartConfig,
+  (cfg) => {
+    if (!topologyStore.activePileId) return
+    setScanQrVinStartConfig(topologyStore.activePileId, cfg)
   },
   { deep: true },
 )
@@ -478,15 +498,27 @@ async function runFlow() {
   }
 }
 
+async function onControlPanelLoginClick() {
+  const pileId = topologyStore.activePileId?.trim()
+  if (!pileId) {
+    ElMessage.warning('请先选择桩')
+    return
+  }
+  await runLoginFlow(pileId)
+}
+
 async function runLoginFlow(targetPileId?: string) {
-  const activePile =
-    typeof targetPileId === 'string' && targetPileId
-      ? topologyStore.piles.find((x) => x.pileId === targetPileId)
-      : topologyStore.activePile
+  ensureTcpEventListener()
+  const pileId =
+    (typeof targetPileId === 'string' && targetPileId.trim()) || topologyStore.activePileId?.trim() || ''
+  const activePile = pileId ? topologyStore.piles.find((x) => x.pileId === pileId) : topologyStore.activePile
   if (!activePile) {
     ElMessage.warning('请先选择桩')
     return
   }
+  await window.unions.jxTcpInvoke('cancelPending', { pileId: activePile.pileId })
+  loginConfig.value.allowTimeoutCount = activePile.allowTimeoutCount
+  loginConfig.value.heartbeatIntervalSec = activePile.heartbeatIntervalSec
   const loginFlow = resolveLoginFlowForPile(activePile)
   if (!loginFlow) {
     ElMessage.warning('当前协议未配置登录认证流程')
@@ -643,7 +675,7 @@ function gunHudAmountLine(pileId: string, gunId: string): string {
 }
 
 function orderTariffTypeLabel(order: JxPileOrder): string {
-  if (order.startAuthSource === '0x40-vin') return 'VIN计费模型'
+  if (order.startAuthSource === '0x40-vin' || order.startAuthSource === '0x59-scan-vin') return 'VIN计费模型'
   const src = order.tariffSnapshot?.source
   if (src === '0x41-vin-embedded' || src === '0x41-vin-local') return 'VIN计费模型'
   if (src === '0x1f-embedded') return '远端启动（报文内嵌费率）'
@@ -1145,6 +1177,18 @@ const cmdFieldMeta: Record<string, Record<string, FieldMeta>> = {
     },
   },
   /** 下行 0x41 回复 VIN 鉴权（41H），见《玖行桩协议2.24》§8.6.2 / 表3.8.4 */
+  '0x59': {
+    timeTag: { name: '时间标识', desc: '报文时间戳（6字节）', decodedKey: 'timeTag', valueType: 'timeTag6' },
+    gunNo: { name: '枪号', desc: '0~29', decodedKey: 'gunNo', valueType: 'u8' },
+    orderNo: { name: '充电订单号', desc: '32字节ASCII，平台扫码后下发', decodedKey: 'orderNo', valueType: 'ascii' },
+  },
+  '0x5b': {
+    timeTag: { name: '时间标识', desc: '报文时间戳（6字节）', decodedKey: 'timeTag', valueType: 'timeTag6' },
+    gunNo: { name: '枪号', desc: '0~29', decodedKey: 'gunNo', valueType: 'u8' },
+    orderNo: { name: '充电订单号', desc: '32字节ASCII，与0x59一致', decodedKey: 'orderNo', valueType: 'ascii' },
+    result: { name: '结果', desc: '1成功 2失败', decodedKey: 'result', enumMap: { 1: '成功', 2: '失败' } },
+    failReason: { name: '失败原因', desc: '失败时有效', decodedKey: 'failReason', valueType: 'u8' },
+  },
   '0x41': {
     timeTag: { name: '时间标识', desc: '字节0~5，时间格式', decodedKey: 'timeTag', valueType: 'timeTag6' },
     vin: { name: 'VIN', desc: '字节6~22，17字节ASCII，不足补0', decodedKey: 'vin', valueType: 'ascii' },
@@ -2276,10 +2320,43 @@ function confirmAddPile() {
               </el-select>
             </div>
             <div class="jx-login-actions">
-              <el-button v-if="!activePileOnline" type="success" class="jx-run" :loading="loginExecuting" @click="() => runLoginFlow()">
+              <el-button
+                v-if="!activePileOnline"
+                type="success"
+                class="jx-run"
+                :loading="loginExecuting"
+                @click="onControlPanelLoginClick"
+              >
                 {{ loginExecuting ? '登录中...' : '登录' }}
               </el-button>
               <el-button v-else class="jx-run" :loading="disconnecting" @click="disconnectActivePile">断开链接</el-button>
+            </div>
+          </div>
+
+          <div v-else-if="selectedFlowId === 'scan-qr-vin-start'" class="jx-control-form">
+            <p class="jx-flow-hint">
+              用户扫码后平台下发 <code>0x59</code>，模拟器回复 <code>0x5B</code> 并创建订单；成功后自动发送带订单号的
+              <code>0x40</code>，鉴权通过后与 VIN 启动一致（<code>0x21</code>→<code>0x22</code>）。<code>0x21</code> 启动结果请在「远端控制启动流程」中配置。
+            </p>
+            <div class="jx-form-row">
+              <span class="jx-form-label">0x5B 回复失败</span>
+              <el-checkbox v-model="scanQrVinStartConfig.simulate5bFail">模拟 0x5B 失败（订单标记启动失败并结束）</el-checkbox>
+            </div>
+            <div class="jx-form-row">
+              <span class="jx-form-label">0x5B 失败原因</span>
+              <el-select
+                v-model="scanQrVinStartConfig.reply5bFailReason"
+                size="small"
+                class="jx-form-control"
+                :disabled="!scanQrVinStartConfig.simulate5bFail"
+              >
+                <el-option :value="1" label="设备故障" />
+                <el-option :value="2" label="充电枪使用中" />
+                <el-option :value="3" label="枪未连接车辆" />
+                <el-option :value="4" label="枪口超范围" />
+                <el-option :value="5" label="参数不支持" />
+                <el-option :value="6" label="其它" />
+              </el-select>
             </div>
           </div>
 
@@ -2533,6 +2610,7 @@ function confirmAddPile() {
                 <div v-else class="jx-start-qr-placeholder">
                   {{ qrDialogLoading ? '正在生成二维码…' : qrDialogText ? '未生成' : '暂无二维码，请确认登录后已下发枪二维码' }}
                 </div>
+                <p class="jx-start-scan-hint">扫码后平台将下发 <code>0x59</code> 触发「扫码VIN启动流程」；请在侧栏流程控制中选择该流程并配置 <code>0x5B</code> 应答。</p>
               </div>
             </el-tab-pane>
             <el-tab-pane label="VIN启动" name="vin">
@@ -3177,6 +3255,17 @@ function confirmAddPile() {
   padding: 12px;
   border: 1px dashed color-mix(in oklab, var(--jx-border) 70%, transparent);
   border-radius: 8px;
+}
+.jx-flow-hint,
+.jx-start-scan-hint {
+  margin: 8px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--jx-muted);
+}
+.jx-flow-hint code,
+.jx-start-scan-hint code {
+  font-size: 11px;
 }
 .jx-start-vin-text {
   font-family: ui-monospace, 'Cascadia Mono', monospace;

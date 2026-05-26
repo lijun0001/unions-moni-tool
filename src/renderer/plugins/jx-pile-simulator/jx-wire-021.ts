@@ -52,7 +52,7 @@ export function resolve021UserExtras(
     const ut = typeof order.request23?.userType === 'number' ? order.request23.userType : 3
     return { userType: Math.max(0, Math.min(0xffff, ut)), userId: order.request23?.userId ?? '' }
   }
-  if (src === '0x40-vin') {
+  if (src === '0x40-vin' || src === '0x59-scan-vin') {
     const gun = pile?.guns.find((g) => g.gunId === order.gunId)
     return { userType: 6, userId: gun?.vin ?? '' }
   }

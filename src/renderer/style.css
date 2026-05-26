@@ -85,3 +85,22 @@ body {
 .um-display {
   font-family: Lexend, ui-sans-serif, system-ui, sans-serif;
 }
+
+/* ShellMenu 固定 z-index 5000；弹窗需更高，避免 macOS 上关闭按钮无法点击 */
+.el-overlay,
+.el-overlay-dialog {
+  z-index: 6100 !important;
+}
+.el-dialog {
+  z-index: 6101 !important;
+}
+.el-message-box {
+  z-index: 6200 !important;
+}
+.el-dialog__headerbtn,
+.el-message-box__headerbtn {
+  pointer-events: auto !important;
+  -webkit-app-region: no-drag;
+  z-index: 1;
+  position: relative;
+}

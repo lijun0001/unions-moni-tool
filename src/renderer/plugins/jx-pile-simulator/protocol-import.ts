@@ -30,6 +30,8 @@ const BASELINE_DIRECTIONS: Record<string, 'up' | 'down'> = {
   '0x41': 'down',
   '0x46': 'up',
   '0x47': 'down',
+  '0x59': 'down',
+  '0x5b': 'up',
 }
 
 function toError(
