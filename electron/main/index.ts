@@ -11,10 +11,13 @@ import {
   getCecLinkByUuid,
   postLocalQueryStartCharge,
   postLocalQueryStopCharge,
+  postLocalQueryTerminalCode,
   pullStationsFromThirdParty,
   queryEquipBusinessPolicyFromThirdParty,
   syncOrderChargeStatusById,
   queryStationStatusFromThirdParty,
+  invalidateInboundAuthToken,
+  invalidateThirdPartyToken,
   setCecLogNotifier,
   startCecHttp,
   stopCecHttp,
@@ -145,6 +148,7 @@ async function installPluginFromPath(sourcePath: string): Promise<InstalledPlugi
     version: manifest.version,
     rootPath: dest,
     entryRelative: entryRel,
+    introDoc: typeof manifest.introDoc === 'string' ? manifest.introDoc : undefined,
   }
 
   const list = store.get('plugins').filter((p) => p.id !== record.id)
@@ -474,7 +478,10 @@ type CecInvokeAction =
   | 'queryStationStatus'
   | 'clientStartCharge'
   | 'clientStopCharge'
+  | 'clientQueryTerminalCode'
   | 'syncOrderStatus'
+  | 'clearInboundToken'
+  | 'clearThirdPartyToken'
 
 function registerIpc() {
   const cecInvoke = async (
@@ -565,6 +572,20 @@ function registerIpc() {
       if (!link) return { ok: false as const, error: '未找到配置' }
       return postLocalQueryStartCharge(link, payload.connectorId, payload.qr, payload.money)
     }
+    if (action === 'clientQueryTerminalCode') {
+      const payload = data as {
+        linkUuid: string
+        qrCode: string
+        longitude?: number
+        latitude?: number
+      }
+      const link = getCecLinkByUuid(payload.linkUuid)
+      if (!link) return { ok: false as const, error: '未找到配置' }
+      return postLocalQueryTerminalCode(link, payload.qrCode, {
+        longitude: payload.longitude,
+        latitude: payload.latitude,
+      })
+    }
     if (action === 'clientStopCharge') {
       const payload = data as { linkUuid: string; startChargeSeq: string; connectorId: string }
       const link = getCecLinkByUuid(payload.linkUuid)
@@ -574,6 +595,18 @@ function registerIpc() {
     if (action === 'syncOrderStatus') {
       const payload = data as { orderId?: string }
       return syncOrderChargeStatusById(String(payload.orderId ?? ''))
+    }
+    if (action === 'clearInboundToken') {
+      const linkUuid = String((data as { linkUuid?: unknown } | undefined)?.linkUuid ?? '').trim()
+      if (!linkUuid) return { ok: false as const, error: 'linkUuid 为空' }
+      invalidateInboundAuthToken(linkUuid)
+      return { ok: true as const }
+    }
+    if (action === 'clearThirdPartyToken') {
+      const linkUuid = String((data as { linkUuid?: unknown } | undefined)?.linkUuid ?? '').trim()
+      if (!linkUuid) return { ok: false as const, error: 'linkUuid 为空' }
+      invalidateThirdPartyToken(linkUuid)
+      return { ok: true as const }
     }
     return { ok: false as const, error: 'unsupported cec action' }
   }

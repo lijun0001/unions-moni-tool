@@ -26,6 +26,8 @@ const BASELINE_DIRECTIONS: Record<string, 'up' | 'down'> = {
   '0x30': 'up',
   '0x26': 'down',
   '0x27': 'up',
+  '0x19': 'up',
+  '0x1a': 'down',
   '0x40': 'up',
   '0x41': 'down',
   '0x46': 'up',

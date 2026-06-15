@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { useRouter } from 'vue-router'
+import WorkspaceFrame from '@renderer/components/WorkspaceFrame.vue'
 
 const router = useRouter()
 </script>
 
 <template>
-  <div class="px-[var(--space-xl)] pb-[var(--space-2xl)] pt-[calc(var(--space-2xl)+3rem)]">
+  <WorkspaceFrame>
     <h1 class="um-display text-2xl font-semibold text-[var(--um-text)]">关于我们</h1>
     <div class="mt-6 max-w-[75ch] space-y-4 text-sm leading-relaxed text-[var(--um-text-muted)]">
       <p>
@@ -21,5 +22,5 @@ const router = useRouter()
     >
       返回首页
     </button>
-  </div>
+  </WorkspaceFrame>
 </template>

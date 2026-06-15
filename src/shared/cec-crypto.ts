@@ -12,6 +12,17 @@ function utf8Exact16(input: string, field: 'DataSecret' | 'DataSecretIV'): Buffe
   return bytes
 }
 
+/** 校验 AES 密钥对；通过返回 null，否则返回错误说明 */
+export function validateCecAesSecretPair(dataSecret: string, dataSecretIV: string): string | null {
+  try {
+    utf8Exact16(dataSecret, 'DataSecret')
+    utf8Exact16(dataSecretIV, 'DataSecretIV')
+    return null
+  } catch (e) {
+    return e instanceof Error ? e.message : String(e)
+  }
+}
+
 export function encryptDataJson(data: string, dataSecret: string, dataSecretIV: string): string {
   const key = utf8Exact16(dataSecret, 'DataSecret')
   const iv = utf8Exact16(dataSecretIV, 'DataSecretIV')

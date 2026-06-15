@@ -11,6 +11,7 @@ export const CEC_DEFAULT_PROTOCOL: CecProtocolMapping = {
     query_station_stats: { path: '/query_station_stats', method: 'POST' },
     query_equip_auth: { path: '/query_equip_auth', method: 'POST' },
     query_equip_business_policy: { path: '/query_equip_business_policy', method: 'POST' },
+    query_terminal_code: { path: '/query_terminal_code', method: 'POST' },
     query_start_charge: { path: '/query_start_charge', method: 'POST' },
     notification_start_charge_result: { path: '/notification_start_charge_result', method: 'POST' },
     query_equip_charge_status: { path: '/query_equip_charge_status', method: 'POST' },

@@ -1,6 +1,6 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
-import type { JxPileOrder, JxOrderStatus } from './types'
+import type { JxOrderTariffSnapshot, JxPileOrder, JxOrderStatus } from './types'
 
 const STORAGE_KEY = 'jx-pile-orders-v1'
 
@@ -29,6 +29,7 @@ export const useJxOrderStore = defineStore('jx-order-store', () => {
           tariffSnapshot: x.tariffSnapshot ?? undefined,
           latest23: x.latest23 ?? undefined,
           latest25: x.latest25 ?? undefined,
+          periodEnergySegments: Array.isArray(x.periodEnergySegments) ? x.periodEnergySegments : undefined,
           latestBms: x.latestBms ?? undefined,
           stoppedAt: typeof x.stoppedAt === 'number' ? x.stoppedAt : undefined,
           excludeFromOrderPush: typeof x.excludeFromOrderPush === 'boolean' ? x.excludeFromOrderPush : undefined,
@@ -105,11 +106,16 @@ export const useJxOrderStore = defineStore('jx-order-store', () => {
     pileId: string,
     orderNo: string,
     latest25: NonNullable<JxPileOrder['latest25']>,
+    periodEnergySegments?: JxPileOrder['periodEnergySegments'],
   ) {
     const list = ordersByPile.value[pileId] ?? []
     const idx = list.findIndex((x) => x.orderNo === orderNo)
     if (idx < 0) return
-    list[idx] = { ...list[idx], latest25 }
+    list[idx] = {
+      ...list[idx],
+      latest25,
+      periodEnergySegments: periodEnergySegments ?? list[idx].periodEnergySegments,
+    }
     ordersByPile.value[pileId] = list
     persist()
   }
@@ -123,6 +129,23 @@ export const useJxOrderStore = defineStore('jx-order-store', () => {
     const idx = list.findIndex((x) => x.orderNo === orderNo)
     if (idx < 0) return
     list[idx] = { ...list[idx], latestBms }
+    ordersByPile.value[pileId] = list
+    persist()
+  }
+
+  function commitTariffSnapshot(pileId: string, orderNo: string, tariffSnapshot: JxOrderTariffSnapshot) {
+    const list = ordersByPile.value[pileId] ?? []
+    const idx = list.findIndex((x) => x.orderNo === orderNo)
+    if (idx < 0) return
+    const item = list[idx]
+    list[idx] = {
+      ...item,
+      tariffSnapshot,
+      request23: {
+        ...item.request23,
+        tariffModelVersionAtStart: tariffSnapshot.version,
+      },
+    }
     ordersByPile.value[pileId] = list
     persist()
   }
@@ -222,6 +245,7 @@ export const useJxOrderStore = defineStore('jx-order-store', () => {
     updateLatest25Snapshot,
     updateLatestBmsSnapshot,
     updateLatest23Snapshot,
+    commitTariffSnapshot,
     markActiveOrdersStoppedByDisconnect,
   }
 })

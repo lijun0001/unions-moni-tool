@@ -1,5 +1,30 @@
 import { describe, expect, it } from 'vitest'
-import { decodeCmdPayload, parseVinAuth41Payload } from './protocol-executor'
+import {
+  decodeCmdPayload,
+  formatVin41DenyMessage,
+  formatVinStartFailureMessage,
+  isVin41AllowCharge,
+  parseVinAuth41Payload,
+} from './protocol-executor'
+
+describe('VIN 0x41 allowChargeFlag', () => {
+  it('isVin41AllowCharge accepts only flag 1', () => {
+    expect(isVin41AllowCharge(1)).toBe(true)
+    expect(isVin41AllowCharge(2)).toBe(false)
+  })
+
+  it('formatVinStartFailureMessage prefixes reason', () => {
+    expect(formatVinStartFailureMessage('请先连接平台（桩需在线）')).toBe(
+      'VIN启动失败：请先连接平台（桩需在线）',
+    )
+    expect(formatVinStartFailureMessage('VIN启动失败：已提示')).toBe('VIN启动失败：已提示')
+  })
+
+  it('formatVin41DenyMessage explains prohibit reason when denied', () => {
+    expect(formatVin41DenyMessage(1, 0)).toBe('')
+    expect(formatVin41DenyMessage(2, 3)).toBe('VIN启动失败：平台禁止充电（黑名单）')
+  })
+})
 
 describe('parseVinAuth41Payload (表 3.8.4 / 71+11N)', () => {
   it('parses billing=2: embedded tariff + order field at byte 39+11N', () => {

@@ -69,6 +69,31 @@ export type ScanQrVinStartRuntimeConfig = {
 
 const remoteStartConfigByPile = new Map<string, RemoteStartRuntimeConfig>()
 const scanQrVinStartConfigByPile = new Map<string, ScanQrVinStartRuntimeConfig>()
+/** 侧栏当前选中的监听流程：决定 0x59 是否走扫码 VIN 启动，0x1F 始终按远程启动处理 */
+const activeListenFlowByPile = new Map<string, string>()
+
+export function isScanQrVinListenFlow(flowId: string | null | undefined): boolean {
+  return flowId === 'scan-qr-vin-start'
+}
+
+export function isRemoteStartListenFlow(flowId: string | null | undefined): boolean {
+  return flowId === 'remote-start' || flowId === 'scan-qr-remote-start'
+}
+
+export function setActiveListenFlow(pileId: string, flowId: string | null | undefined): void {
+  const id = pileId.trim()
+  if (!id) return
+  const fid = String(flowId ?? '').trim()
+  if (!fid) {
+    activeListenFlowByPile.delete(id)
+    return
+  }
+  activeListenFlowByPile.set(id, fid)
+}
+
+export function getActiveListenFlow(pileId: string): string | null {
+  return activeListenFlowByPile.get(pileId.trim()) ?? null
+}
 
 function fakeHex(cmd: string, direction: 'send' | 'receive'): string {
   const dir = direction === 'send' ? 'AA55' : '55AA'
@@ -264,20 +289,25 @@ function parseTariffModelFrom1fTail(tailHexRaw: string): { model: ParsedTariffMo
   }
 }
 
+/** 已在专用分支记录接收日志、避免与通用 frame 日志重复的下行命令 */
+const DEDICATED_RECEIVE_LOG_CMDS = new Set(['0x1f', '0x59'])
+
 /**
  * 组装上行 `0x20` 数据域（与 `CM20Data218` / `StartRespHandler218` 一致）。
  * 在下行 `0x1F` 数据域基础上 **删除「账户余额」4 字节**；字段顺序为：…控制参数→充电模式→启动方式→定时启动时间→用户操作码→计费模型选择→〔条件费率扩展〕→执行结果→失败原因。
- * **不含** `0x1F` 序号 9「账户余额」；服务端数据类亦无嵌入式计费字节以外的附加字段。
+ * **不含** `0x1F` 序号 9「账户余额」；时标使用桩侧当前北京时间（与 `0x21` 等上行报文一致）。
  */
-function buildCm20PayloadFrom1f(requestBodyHex: string, result: 1 | 2, failReason: number): string {
+export function buildCm20PayloadFrom1f(requestBodyHex: string, result: 1 | 2, failReason: number): string {
   const body = (requestBodyHex || '').replace(/[^0-9a-f]/gi, '').toLowerCase()
   const retHex = Math.max(1, Math.min(2, result)).toString(16).padStart(2, '0')
   const failHex = Math.max(0, Math.min(255, failReason)).toString(16).padStart(2, '0')
+  const freshTimeTag = makeTimeTag6Hex()
   const prefixThroughControlParamHex = 174
   if (body.length < prefixThroughControlParamHex + 8) {
-    return `${body}${retHex}${failHex}`
+    const tail = body.length >= 12 ? body.slice(12) : body
+    return `${freshTimeTag}${tail}${retHex}${failHex}`
   }
-  const head = body.slice(0, prefixThroughControlParamHex)
+  const head = freshTimeTag + body.slice(12, prefixThroughControlParamHex)
   const tailFromChargeMode = body.slice(prefixThroughControlParamHex + 8)
   if (tailFromChargeMode.length < 30) {
     return `${head}${tailFromChargeMode}${retHex}${failHex}`
@@ -312,6 +342,79 @@ function defaultOrderTariffSnapshot(): JxOrderTariffSnapshot {
     source: 'pile-0x37',
     updatedAt: Date.now(),
   }
+}
+
+type PendingEmbeddedTariff = NonNullable<NonNullable<JxPileOrder['request23']>['pendingEmbeddedTariff']>
+
+function pendingEmbeddedFromModel(m: ParsedTariffModel): PendingEmbeddedTariff {
+  return {
+    version: m.version,
+    parkingRate: m.parkingRate,
+    periods: m.periods.map((p) => ({ ...p })),
+    updatedAt: m.updatedAt,
+  }
+}
+
+function pendingEmbeddedToParsed(m: PendingEmbeddedTariff): ParsedTariffModel {
+  return {
+    version: m.version,
+    parkingRate: m.parkingRate,
+    periods: m.periods.map((p) => ({ ...p })),
+    updatedAt: m.updatedAt,
+  }
+}
+
+/** 枪启动成功（0x22）后，根据订单启动来源与 pending 内嵌费率生成订单费率副本 */
+export function buildOrderTariffSnapshotForOrder(pile: JxTopologyPile, order: JxPileOrder): JxOrderTariffSnapshot {
+  const r23 = order.request23
+  const billingSel: 1 | 2 = (r23?.billingModelSelect1f ?? r23?.billingModelSelect) === 2 ? 2 : 1
+  const pending = r23?.pendingEmbeddedTariff
+  const embedded = pending ? pendingEmbeddedToParsed(pending) : null
+
+  if (order.startAuthSource === '0x19-card') {
+    return tariffSnapshotForCard1aOrder(pile, embedded, billingSel)
+  }
+  if (order.startAuthSource === '0x40-vin' || order.startAuthSource === '0x59-scan-vin') {
+    return tariffSnapshotForVin41Order(pile, embedded, billingSel)
+  }
+  return tariffSnapshotForNewOrder(pile, embedded, billingSel === 2 && !!embedded)
+}
+
+function commitOrderTariffOnStartSuccess(pile: JxTopologyPile, pileId: string, orderNo: string): void {
+  const orderStore = useJxOrderStore()
+  const order = orderStore.listByPile(pileId).find((x) => x.orderNo === orderNo)
+  if (!order || order.tariffSnapshot) return
+  const snap = buildOrderTariffSnapshotForOrder(pile, order)
+  orderStore.commitTariffSnapshot(pileId, orderNo, snap)
+}
+
+function appendEmbeddedTariffSegments(
+  dataHex: string,
+  cursor: number,
+  segments: HexSegment[],
+): { nextCursor: number; model: ParsedTariffModel; periodCount: number } | null {
+  const rest = dataHex.slice(cursor)
+  const emb = parseTariffModelFrom1fTail(rest)
+  if (!emb.model || emb.consumedBytes <= 0) return null
+  const tHex = rest.slice(0, emb.consumedBytes * 2)
+  let off = 0
+  const takeEmbSeg = (name: string, bytes: number): void => {
+    const hex = tHex.slice(off, off + bytes * 2)
+    off += bytes * 2
+    segments.push({ name, hex, bytes })
+  }
+  takeEmbSeg('tariffModelVersion', 4)
+  takeEmbSeg('parkingRate', 4)
+  takeEmbSeg('periodCount', 1)
+  const periodCount = emb.model.periods.length
+  for (let i = 0; i < periodCount; i += 1) {
+    takeEmbSeg(`period${i + 1}StartHour`, 1)
+    takeEmbSeg(`period${i + 1}StartMinute`, 1)
+    takeEmbSeg(`period${i + 1}Type`, 1)
+    takeEmbSeg(`period${i + 1}ElectricRate`, 4)
+    takeEmbSeg(`period${i + 1}ServiceRate`, 4)
+  }
+  return { nextCursor: cursor + emb.consumedBytes * 2, model: emb.model, periodCount }
 }
 
 function tariffSnapshotForNewOrder(pile: JxTopologyPile, embedded: ParsedTariffModel | null, useEmbedded: boolean): JxOrderTariffSnapshot {
@@ -365,6 +468,18 @@ function generateVinLedOrderNo(): string {
   return `VIN${digits}`
 }
 
+function cardAuthProhibitReasonText(code: number): string {
+  const m: Record<number, string> = {
+    1: '卡余额不足',
+    2: '配额不足',
+    3: '挂失',
+    4: '黑名单',
+    5: '未登记',
+    6: '其它',
+  }
+  return m[code] ?? `其它(码${code})`
+}
+
 function vinAuthProhibitReasonText(code: number): string {
   const m: Record<number, string> = {
     1: '余额不足（≤0）',
@@ -384,10 +499,45 @@ function vinAuthProhibitReasonText(code: number): string {
   return m[code] ?? `其它(码${code})`
 }
 
+/** 0x41 允许充电标志：1 允许；2 禁止（玖行桩协议 §8.6.2） */
+export function isVin41AllowCharge(allowChargeFlag: number): boolean {
+  return allowChargeFlag === 1
+}
+
+export function formatVinStartFailureMessage(reason: string): string {
+  const text = String(reason ?? '').trim()
+  if (!text) return 'VIN启动失败：未知原因'
+  if (text.startsWith('VIN启动失败')) return text
+  return `VIN启动失败：${text}`
+}
+
+export function formatVin41DenyMessage(allowChargeFlag: number, prohibitReason: number): string {
+  if (isVin41AllowCharge(allowChargeFlag)) return ''
+  return formatVinStartFailureMessage(
+    `平台禁止充电（${vinAuthProhibitReasonText(prohibitReason)}）`,
+  )
+}
+
+const JX_VIN_AUTH_DENIED_EVENT = 'jx-vin-auth-denied'
+
+export { JX_VIN_AUTH_DENIED_EVENT }
+
+function emitVinAuthDeniedNotice(pileId: string, gunId: string, message: string): void {
+  if (typeof window === 'undefined' || !message) return
+  window.dispatchEvent(new CustomEvent(JX_VIN_AUTH_DENIED_EVENT, { detail: { pileId, gunId, message } }))
+}
+
 /**
  * 上行 `0x40`：与 `CM40Data224` 一致 — 时间标识(6)+VIN(17)+枪号(1)+充电订单号(32)，共 56 字节。
  * `orderNo` 传空字符串时订单号域为 **32 字节全 `0x00`**（VIN 启动流程默认）。
  */
+/** 上行 `0x19`（表-3.8.1）：时间标识(6)+卡号(16 ASCII)+枪号(1)，共 23 字节。 */
+export function buildCardAuth19Payload(pile: JxTopologyPile, gunId: string, cardNo: string): string {
+  const gunHex = gunIdToGunNoHex(pile, gunId)
+  const card = cardNo.trim().slice(0, 16)
+  return `${makeTimeTag6Hex()}${asciiFixedHex(card, 16)}${gunHex}`
+}
+
 export function buildVinAuth40Payload(pile: JxTopologyPile, gunId: string, vin: string, orderNo: string): string {
   const gunHex = gunIdToGunNoHex(pile, gunId)
   const v = vin.trim().toUpperCase().slice(0, 17)
@@ -479,6 +629,55 @@ export function parseVinAuth41Payload(dataHexRaw: string): {
   return {
     timeTag: decodeTimeTag6(timeTagHex),
     vin: parseAsciiFixed(vinHex).trim(),
+    accountBalanceFen: decodeU32Le(balanceHex),
+    allowChargeFlag: Number.parseInt(allowHex, 16),
+    prohibitReason: Number.parseInt(prohibitHex, 16),
+    billingModelSelect,
+    embeddedTariffModel,
+    orderNo,
+  }
+}
+
+/**
+ * 下行 `0x1A`（表-3.8.2）：时间(6)+卡号(16)+余额(4)+允许标志(1)+不可充原因(1)+计费选择(1)+〔费率扩展〕+订单号(32)。
+ */
+export function parseCardAuth1aPayload(dataHexRaw: string): {
+  timeTag: string
+  cardNo: string
+  accountBalanceFen: number
+  allowChargeFlag: number
+  prohibitReason: number
+  billingModelSelect: 1 | 2
+  embeddedTariffModel: ParsedTariffModel | null
+  orderNo: string | null
+} | null {
+  const dataHex = (dataHexRaw || '').replace(/[^0-9a-f]/gi, '').toLowerCase()
+  if (dataHex.length < 58) return null
+  const timeTagHex = dataHex.slice(0, 12)
+  const cardHex = dataHex.slice(12, 44)
+  const balanceHex = dataHex.slice(44, 52)
+  const allowHex = dataHex.slice(52, 54)
+  const prohibitHex = dataHex.slice(54, 56)
+  const billingHex = dataHex.slice(56, 58)
+  const billingModelSelect: 1 | 2 = Number.parseInt(billingHex, 16) === 2 ? 2 : 1
+  let embeddedTariffModel: ParsedTariffModel | null = null
+  let orderNo: string | null = null
+  if (billingModelSelect === 2) {
+    const tailFrom30 = dataHex.slice(58)
+    const emb = parseTariffModelFrom1fTail(tailFrom30)
+    if (!emb.model || emb.consumedBytes <= 0) return null
+    embeddedTariffModel = emb.model
+    const orderHex = dataHex.slice(58 + emb.consumedBytes * 2, 58 + emb.consumedBytes * 2 + 64)
+    if (orderHex.length < 64) return null
+    const parsedOrder = parseAsciiFixed(orderHex).trim()
+    orderNo = parsedOrder.length > 0 ? parsedOrder : null
+  } else if (dataHex.length >= 122) {
+    const parsedOrder = parseAsciiFixed(dataHex.slice(58, 122)).trim()
+    orderNo = parsedOrder.length > 0 ? parsedOrder : null
+  }
+  return {
+    timeTag: decodeTimeTag6(timeTagHex),
+    cardNo: parseAsciiFixed(cardHex).trim(),
     accountBalanceFen: decodeU32Le(balanceHex),
     allowChargeFlag: Number.parseInt(allowHex, 16),
     prohibitReason: Number.parseInt(prohibitHex, 16),
@@ -709,11 +908,13 @@ export function decodeCmdPayload(cmd: string, dataHexRaw: string, protocolId?: s
     out.billingModelSelect = bmsel
     out.billingModelSelect1f = bmsel === 1 || bmsel === 2 ? bmsel : null
     if (bmsel === 2) {
-      const rest = remain()
-      const { model, consumedBytes } = parseTariffModelFrom1fTail(rest)
-      if (model && consumedBytes > 0) {
-        take('embeddedTariffBlock', consumedBytes)
-        out.embeddedTariffModel = model
+      const emb = appendEmbeddedTariffSegments(dataHex, cursor, segments)
+      if (emb) {
+        cursor = emb.nextCursor
+        out.tariffModelVersion = emb.model.version
+        out.parkingRate = emb.model.parkingRate
+        out.periodCount = emb.periodCount
+        out.embeddedTariffModel = emb.model
       }
     }
   } else if (c === '0x20') {
@@ -732,10 +933,12 @@ export function decodeCmdPayload(cmd: string, dataHexRaw: string, protocolId?: s
     const billingModelSelect = take('billingModelSelect', 1)
     const bmsel20 = billingModelSelect ? Number.parseInt(billingModelSelect, 16) : null
     if (bmsel20 === 2) {
-      const rest20 = remain()
-      const emb20 = parseTariffModelFrom1fTail(rest20)
-      if (emb20.model && emb20.consumedBytes > 0) {
-        take('embeddedTariffBlock', emb20.consumedBytes)
+      const emb20 = appendEmbeddedTariffSegments(dataHex, cursor, segments)
+      if (emb20) {
+        cursor = emb20.nextCursor
+        out.tariffModelVersion = emb20.model.version
+        out.parkingRate = emb20.model.parkingRate
+        out.periodCount = emb20.periodCount
         out.embeddedTariffModel = emb20.model
       }
     }
@@ -757,6 +960,44 @@ export function decodeCmdPayload(cmd: string, dataHexRaw: string, protocolId?: s
     out.billingModelSelect1f = bmsel20 === 1 || bmsel20 === 2 ? bmsel20 : null
     out.executeResult = executeResult ? Number.parseInt(executeResult, 16) : null
     out.failReason = failReason ? Number.parseInt(failReason, 16) : null
+  } else if (c === '0x19') {
+    const timeTag = take('timeTag', 6)
+    const cardNo = take('cardNo', 16)
+    const gunNo = take('gunNo', 1)
+    out.timeTag = decodeTimeTag6(timeTag)
+    out.cardNo = parseAsciiFixed(cardNo)
+    out.gunNo = gunNo ? Number.parseInt(gunNo, 16) : null
+  } else if (c === '0x1a') {
+    const timeTag = take('timeTag', 6)
+    const cardNo = take('cardNo', 16)
+    const accountBalance = take('accountBalance', 4)
+    const allowChargeFlag = take('allowChargeFlag', 1)
+    const prohibitReason = take('prohibitReason', 1)
+    const billingModelSelect = take('billingModelSelect', 1)
+    out.timeTag = decodeTimeTag6(timeTag)
+    out.cardNo = parseAsciiFixed(cardNo)
+    out.accountBalanceFen = decodeU32Le(accountBalance)
+    out.allowChargeFlag = allowChargeFlag ? Number.parseInt(allowChargeFlag, 16) : null
+    out.prohibitReason = prohibitReason ? Number.parseInt(prohibitReason, 16) : null
+    const bms1a = billingModelSelect ? Number.parseInt(billingModelSelect, 16) : null
+    out.billingModelSelect = bms1a
+    if (bms1a === 2) {
+      const emb1a = appendEmbeddedTariffSegments(dataHex, cursor, segments)
+      if (emb1a) {
+        cursor = emb1a.nextCursor
+        out.tariffModelVersion = emb1a.model.version
+        out.parkingRate = emb1a.model.parkingRate
+        out.periodCount = emb1a.periodCount
+        out.embeddedTariffModel = emb1a.model
+      }
+      if (remain().length >= 64) {
+        const orderNo1a = take('orderNo', 32)
+        out.orderNo = parseAsciiFixed(orderNo1a)
+      }
+    } else if (remain().length >= 64) {
+      const orderNo1a = take('orderNo', 32)
+      out.orderNo = parseAsciiFixed(orderNo1a)
+    }
   } else if (c === '0x40') {
     const timeTag = take('timeTag', 6)
     const vin = take('vin', 17)
@@ -799,32 +1040,12 @@ export function decodeCmdPayload(cmd: string, dataHexRaw: string, protocolId?: s
     const bms41 = billingModelSelect ? Number.parseInt(billingModelSelect, 16) : null
     out.billingModelSelect = bms41
     if (bms41 === 2) {
-      const rest41 = remain()
-      const emb41 = parseTariffModelFrom1fTail(rest41)
-      if (emb41.model && emb41.consumedBytes > 0) {
-        const tHex = rest41.slice(0, emb41.consumedBytes * 2)
-        let off = 0
-        const take41Seg = (name: string, bytes: number): string => {
-          const hex = tHex.slice(off, off + bytes * 2)
-          off += bytes * 2
-          segments.push({ name, hex, bytes })
-          return hex
-        }
-        take41Seg('tariffModelVersion', 4)
-        take41Seg('parkingRate', 4)
-        take41Seg('periodCount', 1)
-        const periodCount = emb41.model.periods.length
-        for (let i = 0; i < periodCount; i += 1) {
-          take41Seg(`period${i + 1}StartHour`, 1)
-          take41Seg(`period${i + 1}StartMinute`, 1)
-          take41Seg(`period${i + 1}Type`, 1)
-          take41Seg(`period${i + 1}ElectricRate`, 4)
-          take41Seg(`period${i + 1}ServiceRate`, 4)
-        }
-        cursor += emb41.consumedBytes * 2
+      const emb41 = appendEmbeddedTariffSegments(dataHex, cursor, segments)
+      if (emb41) {
+        cursor = emb41.nextCursor
         out.tariffModelVersion = emb41.model.version
         out.parkingRate = emb41.model.parkingRate
-        out.periodCount = periodCount
+        out.periodCount = emb41.periodCount
         out.embeddedTariffModel = emb41.model
       }
       if (remain().length >= 64) {
@@ -1519,21 +1740,24 @@ export function ensureTcpEventListener() {
       const remote = pile ? `${pile.tcpHost ?? '127.0.0.1'}:${pile.tcpPort ?? 9000}` : 'socket'
       const cmd = String(evt.cmd ?? 'TCP-FRAME')
       const dataHex = String(evt.dataHex ?? '')
-      logs.appendLog(pileId, {
-        t: Date.now(),
-        pileId,
-        command: cmd,
-        direction: 'receive',
-        remoteIp: remote,
-        rawHex: toHexPairs(String(evt.frameHex ?? '')),
-        structured: {
-          type: 'frame',
-          cmd,
-          dataHex,
-          decoded: decodeCmdPayload(cmd, dataHex, pile?.protocolId),
-          frameHex: evt.frameHex,
-        },
-      })
+      const normalizedCmd = normalizeCmd(cmd)
+      if (!DEDICATED_RECEIVE_LOG_CMDS.has(normalizedCmd)) {
+        logs.appendLog(pileId, {
+          t: Date.now(),
+          pileId,
+          command: cmd,
+          direction: 'receive',
+          remoteIp: remote,
+          rawHex: toHexPairs(String(evt.frameHex ?? '')),
+          structured: {
+            type: 'frame',
+            cmd,
+            dataHex,
+            decoded: decodeCmdPayload(cmd, dataHex, pile?.protocolId),
+            frameHex: evt.frameHex,
+          },
+        })
+      }
 
       if (normalizeCmd(cmd) === '0x06' && pile) {
         const syncReplyPayload = makeSyncReplyPayload(1, 0)
@@ -1662,6 +1886,23 @@ export function ensureTcpEventListener() {
       }
 
       if (normalizeCmd(cmd) === '0x59' && pile) {
+        const listenFlow = getActiveListenFlow(pileId)
+        if (!isScanQrVinListenFlow(listenFlow)) {
+          logs.appendLog(pileId, {
+            t: Date.now(),
+            pileId,
+            command: '0x59',
+            direction: 'receive',
+            remoteIp: remote,
+            rawHex: toHexPairs(String(evt.frameHex ?? '')),
+            structured: {
+              type: 'scan-qr-vin-start-ignored',
+              activeFlow: listenFlow,
+              detail: '当前未选择「扫码VIN启动流程」，忽略 0x59（请选用扫码远程启动流程等待 0x1F）',
+            },
+          })
+          return
+        }
         const body = (dataHex || '').replace(/[^0-9a-f]/gi, '').toLowerCase()
         const parsed59 = parseVinStart59Payload(body)
         const gunNoHex =
@@ -1677,7 +1918,6 @@ export function ensureTcpEventListener() {
         const reply5b = resolveScanQrVin5bReply(cfg59, business5b)
 
         if (parsed59 && orderNo) {
-          const tariffSnapshot = tariffSnapshotForNewOrder(pile, null, false)
           const order: JxPileOrder = {
             orderNo,
             pileId,
@@ -1687,7 +1927,6 @@ export function ensureTcpEventListener() {
             startParam: '扫码VIN启动',
             startAt: Date.now(),
             status: 'created',
-            tariffSnapshot,
             request23: {
               vin: vin || undefined,
               userType: 6,
@@ -1698,7 +1937,6 @@ export function ensureTcpEventListener() {
               startMode: 1,
               billingModelSelect: 1,
               billingModelSelect1f: 1,
-              tariffModelVersionAtStart: tariffSnapshot.version,
             },
             process25: [],
             process30: [],
@@ -1776,6 +2014,7 @@ export function ensureTcpEventListener() {
       }
 
       if (normalizeCmd(cmd) === '0x1f' && pile) {
+        const listenFlow = getActiveListenFlow(pileId)
         const body = (dataHex || '').replace(/[^0-9a-f]/gi, '').toLowerCase()
         const d = decodeCmdPayload('0x1f', body, pile.protocolId) as Record<string, unknown>
         const gunNoHex =
@@ -1797,7 +2036,8 @@ export function ensureTcpEventListener() {
         const rawSel = d.billingModelSelect1f ?? d.billingModelSelect
         const billingModelSelect1f: 1 | 2 = rawSel === 2 ? 2 : 1
         const embedded = (d.embeddedTariffModel ?? null) as ParsedTariffModel | null
-        const tariffSnapshot = tariffSnapshotForNewOrder(pile, embedded, billingModelSelect1f === 2 && !!embedded)
+        const pendingEmbeddedTariff =
+          billingModelSelect1f === 2 && embedded ? pendingEmbeddedFromModel(embedded) : undefined
         const gunId = gunHexToGunId(pile, gunNoHex)
         const gun = gunId ? pile.guns.find((g) => g.gunId === gunId) : null
 
@@ -1810,7 +2050,6 @@ export function ensureTcpEventListener() {
           startParam: `控制:${controlMode} 参数:${controlParam} 计费:${billingModelSelect1f}`,
           startAt: Date.now(),
           status: 'created',
-          tariffSnapshot,
           request23: {
             userId,
             userType,
@@ -1824,12 +2063,28 @@ export function ensureTcpEventListener() {
             billingModelSelect1f,
             billingModelSelect: billingModelSelect1f,
             accountBalanceFen,
-            tariffModelVersionAtStart: tariffSnapshot.version,
+            pendingEmbeddedTariff,
           },
           process25: [],
           process30: [],
         }
         orderStore.upsertOrder(order)
+
+        logs.appendLog(pileId, {
+          t: Date.now(),
+          pileId,
+          command: '0x1f',
+          direction: 'receive',
+          remoteIp: remote,
+          rawHex: toHexPairs(String(evt.frameHex ?? '')),
+          structured: {
+            type: isRemoteStartListenFlow(listenFlow) ? 'scan-qr-remote-start-request' : 'remote-start-request',
+            activeFlow: listenFlow,
+            responseDataHex: body,
+            decoded: d,
+            ok: true,
+          },
+        })
 
         let executeResult: 1 | 2 = 1
         let failReason = 0
@@ -1858,6 +2113,7 @@ export function ensureTcpEventListener() {
         }
 
         const payload20 = buildCm20PayloadFrom1f(body, executeResult, failReason)
+        const payload20Bytes = Math.floor(payload20.length / 2)
         void tcpInvoke('send', { pileId, cmd: '0x20', pileNo: pile.pileId, dataHex: payload20, timeoutMs: 5000 })
           .then((ret) => {
             logs.appendLog(pileId, {
@@ -1870,12 +2126,30 @@ export function ensureTcpEventListener() {
               structured: {
                 type: 'auto-remote-start-reply',
                 requestDataHex: payload20,
+                payloadBytes: payload20Bytes,
                 decoded: decodeCmdPayload('0x20', payload20),
                 ok: ret.ok === true,
+                error: ret.ok === true ? undefined : String(ret.error ?? '发送0x20失败'),
               },
             })
           })
-          .catch(() => {})
+          .catch((error: unknown) => {
+            logs.appendLog(pileId, {
+              t: Date.now(),
+              pileId,
+              command: '0x20',
+              direction: 'send',
+              remoteIp: remote,
+              rawHex: '',
+              structured: {
+                type: 'auto-remote-start-reply',
+                requestDataHex: payload20,
+                payloadBytes: payload20Bytes,
+                ok: false,
+                error: String(error ?? '发送0x20异常'),
+              },
+            })
+          })
 
         if (executeResult === 1 && gun) {
           const cfg = remoteConfigForPile(pileId)
@@ -1920,6 +2194,7 @@ export function ensureTcpEventListener() {
         const gunId = gunHexToGunId(pile, gunNoHex)
         const pending = gunId ? pendingStartAck.get(`${pileId}:${gunId}`) : undefined
         if (pending && pending.startResult === 1) {
+          commitOrderTariffOnStartSuccess(pile, pileId, pending.orderNo)
           topo.applyStatePatch(pileId, {
             status: 'charging',
             gunPatch: { gunId: pending.gunId, status: 'charging' },
@@ -1940,7 +2215,7 @@ export function ensureTcpEventListener() {
             const sample = advanceJxChargeElectricalRuntime(rt, order, pile, workInfoSec)
             const p25 = build025PayloadWire(order, sample, workInfoSec, pile)
             const p30 = build030PayloadWire(order, sample, pile, workInfoSec)
-            orderStore.updateLatest25Snapshot(pileId, pending.orderNo, p25.snapshot)
+            orderStore.updateLatest25Snapshot(pileId, pending.orderNo, p25.snapshot, p25.periodEnergySegments)
             orderStore.updateLatestBmsSnapshot(pileId, pending.orderNo, {
               at: Date.now(),
               soc: sample.soc,
@@ -2195,6 +2470,7 @@ export function disposeJxPileRuntime(pileId: string): void {
   pendingStartAck.delete(pileId)
   remoteStartConfigByPile.delete(pileId)
   scanQrVinStartConfigByPile.delete(pileId)
+  activeListenFlowByPile.delete(pileId)
 }
 
 /**
@@ -2509,6 +2785,84 @@ function evaluateScanQrVinBusinessChecks(
   return { result: 1, reason: 0 }
 }
 
+function tariffSnapshotForCard1aOrder(
+  pile: JxTopologyPile,
+  embedded: ParsedTariffModel | null,
+  billingSel: 1 | 2,
+): JxOrderTariffSnapshot {
+  if (billingSel === 2 && embedded) {
+    return {
+      version: embedded.version,
+      parkingRate: embedded.parkingRate,
+      periods: embedded.periods.map((p) => ({ ...p })),
+      source: '0x1a-embedded',
+      updatedAt: embedded.updatedAt,
+    }
+  }
+  if (pile.tariffModel && pile.tariffModel.periods.length > 0) {
+    const t = tariffSnapshotFromPileModel(pile.tariffModel)
+    return { ...t, source: '0x1a-local' }
+  }
+  const d = defaultOrderTariffSnapshot()
+  return { ...d, source: '0x1a-local' }
+}
+
+function dispatchCardAuth21After1a(
+  pile: JxTopologyPile,
+  pileId: string,
+  gunId: string,
+  orderNo: string,
+  authOk: boolean,
+  parsed1a: NonNullable<ReturnType<typeof parseCardAuth1aPayload>>,
+  remote: string,
+): void {
+  const orderStore = useJxOrderStore()
+  const logs = useJxRuntimeLogStore()
+  const cfg = remoteConfigForPile(pileId)
+  const gunNoHex = gunIdToGunNoHex(pile, gunId)
+  const startResult21: 1 | 2 = authOk ? cfg.startResult : 2
+  const failReason21 = authOk ? cfg.failReason : Math.min(Math.max(parsed1a.prohibitReason, 0), 255)
+
+  setTimeout(() => {
+    const od = orderStore.listByPile(pileId).find((x) => x.orderNo === orderNo)
+    const payload21 = make21Payload(pile, od, gunNoHex || '00', startResult21, failReason21)
+    void tcpInvoke('send', { pileId, cmd: '0x21', pileNo: pile.pileId, dataHex: payload21, timeoutMs: 5000 })
+      .then((r21) => {
+        logs.appendLog(pileId, {
+          t: Date.now(),
+          pileId,
+          command: '0x21',
+          direction: 'send',
+          remoteIp: remote,
+          rawHex: toHexPairs(String(r21.requestFrameHex ?? '')),
+          structured: {
+            type: 'card-auth-start-result',
+            requestDataHex: payload21,
+            decoded: decodeCmdPayload('0x21', payload21, pile.protocolId),
+            ok: r21.ok === true,
+          },
+        })
+        pendingStartAck.set(`${pileId}:${gunId}`, { orderNo, gunId, startResult: startResult21 })
+        if (!authOk) {
+          orderStore.updateOrderStatus(pileId, orderNo, {
+            status: 'failed',
+            failReasonCode: parsed1a.prohibitReason,
+            failReasonText: cardAuthProhibitReasonText(parsed1a.prohibitReason),
+          })
+        } else if (startResult21 === 2) {
+          orderStore.updateOrderStatus(pileId, orderNo, {
+            status: 'failed',
+            failReasonCode: cfg.failReason,
+            failReasonText: failReasonText(cfg.failReason),
+          })
+        } else {
+          orderStore.updateOrderStatus(pileId, orderNo, { status: 'starting' })
+        }
+      })
+      .catch(() => {})
+  }, 2000)
+}
+
 function dispatchVinAuth21After41(
   pile: JxTopologyPile,
   pileId: string,
@@ -2637,10 +2991,13 @@ async function runScanQrVinAuthContinuation(
     return
   }
 
-  const authOk = parsed.allowChargeFlag === 1
+  const authOk = isVin41AllowCharge(parsed.allowChargeFlag)
   const cfg = remoteConfigForPile(pileId)
   const excludeFromOrderPush = !authOk || cfg.startResult === 2
-  const tariffSnapshot = tariffSnapshotForVin41Order(pile, parsed.embeddedTariffModel, parsed.billingModelSelect)
+  const pendingEmbeddedTariff =
+    parsed.billingModelSelect === 2 && parsed.embeddedTariffModel
+      ? pendingEmbeddedFromModel(parsed.embeddedTariffModel)
+      : undefined
 
   const existing = orderStore.listByPile(pileId).find((x) => x.orderNo === orderNo)
   orderStore.upsertOrder({
@@ -2655,7 +3012,6 @@ async function runScanQrVinAuthContinuation(
     failReasonCode: authOk ? undefined : parsed.prohibitReason,
     failReasonText: authOk ? undefined : vinAuthProhibitReasonText(parsed.prohibitReason),
     excludeFromOrderPush,
-    tariffSnapshot,
     request23: {
       vin: parsed.vin || vin,
       userType: 6,
@@ -2667,13 +3023,65 @@ async function runScanQrVinAuthContinuation(
       billingModelSelect: parsed.billingModelSelect,
       billingModelSelect1f: parsed.billingModelSelect,
       accountBalanceFen: parsed.accountBalanceFen,
-      tariffModelVersionAtStart: tariffSnapshot.version,
+      pendingEmbeddedTariff,
     },
     process25: [],
     process30: [],
   })
 
-  dispatchVinAuth21After41(pile, pileId, gunId, orderNo, authOk, parsed, remote)
+  if (!authOk) {
+    emitVinAuthDeniedNotice(
+      pileId,
+      gunId,
+      formatVin41DenyMessage(parsed.allowChargeFlag, parsed.prohibitReason),
+    )
+    return
+  }
+
+  dispatchVinAuth21After41(pile, pileId, gunId, orderNo, true, parsed, remote)
+}
+
+/** 判断订单是否为当前枪上正在进行的充电会话（与 `pendingStartAck` / 0x25 推送定时器一致） */
+export function isGunOrderLiveSession(
+  orderNo: string,
+  pendingOrderNo: string | undefined,
+  hasChargeTimer: boolean,
+  gunStatus: string,
+): boolean {
+  if (!pendingOrderNo || pendingOrderNo !== orderNo) return false
+  if (hasChargeTimer) return true
+  return gunStatus === 'charging'
+}
+
+export function isLiveChargingOrder(pileId: string, orderNo: string): boolean {
+  const orderStore = useJxOrderStore()
+  const topo = useJxTopologyStore()
+  const order = orderStore.listByPile(pileId).find((x) => x.orderNo === orderNo)
+  if (!order) return false
+  const key = `${pileId}:${order.gunId}`
+  const pending = pendingStartAck.get(key)
+  const gun = topo.piles.find((x) => x.pileId === pileId)?.guns.find((g) => g.gunId === order.gunId)
+  return isGunOrderLiveSession(orderNo, pending?.orderNo, chargingInfoTimers.has(key), gun?.status ?? 'idle')
+}
+
+/**
+ * 强制完成非当前充电会话的订单：仅更新订单状态并上送 0x23，不停止桩/枪正在进行的其它充电。
+ */
+export function forceCompleteOrder(
+  pileId: string,
+  orderNo: string,
+  reasonText = '充电完成',
+  reasonCode = 1000,
+): void {
+  const orderStore = useJxOrderStore()
+  const order = orderStore.listByPile(pileId).find((x) => x.orderNo === orderNo)
+  if (!order) return
+  orderStore.updateOrderStatus(pileId, orderNo, {
+    status: 'stopped',
+    failReasonCode: reasonCode,
+    failReasonText: reasonText,
+  })
+  reportStoppedOrderIfOnline(pileId, orderNo)
 }
 
 export function forceStopOrderCharging(
@@ -2682,11 +3090,17 @@ export function forceStopOrderCharging(
   reasonText = '急停按下',
   reasonCode = 1007,
 ): void {
+  if (!isLiveChargingOrder(pileId, orderNo)) {
+    forceCompleteOrder(pileId, orderNo, '充电完成', 1000)
+    return
+  }
   const topo = useJxTopologyStore()
   const orderStore = useJxOrderStore()
   const order = orderStore.listByPile(pileId).find((x) => x.orderNo === orderNo)
   if (!order) return
+  const key = `${pileId}:${order.gunId}`
   stop25Push(pileId, order.gunId)
+  pendingStartAck.delete(key)
   topo.applyStatePatch(pileId, {
     status: 'idle',
     gunPatch: { gunId: order.gunId, status: 'linked', soc: undefined },
@@ -2702,22 +3116,23 @@ export function forceStopOrderCharging(
 /**
  * 拓扑「VIN 鉴权启动」：上行 `0x40` 并等待 `0x41`。
  * 订单号始终本地生成（`VIN`+20 位数字），不采用平台 `0x41` 末尾订单号校验。
- * 鉴权失败仍会建单并上送 `0x21`（启动失败）；鉴权通过但模拟器配置启动失败时不做 `0x23`/`0x33` 订单推送。
+ * 平台 `0x41` 禁止充电时不继续上送 `0x21`；鉴权通过但模拟器配置启动失败时不做 `0x23`/`0x33` 订单推送。
  */
 export async function runVinAuthRemoteStart(pileId: string, gunId: string): Promise<{ ok: boolean; error?: string }> {
   ensureTcpEventListener()
   const topo = useJxTopologyStore()
   const orderStore = useJxOrderStore()
   const logs = useJxRuntimeLogStore()
+  const fail = (reason: string) => ({ ok: false as const, error: formatVinStartFailureMessage(reason) })
   const pile = topo.piles.find((x) => x.pileId === pileId)
-  if (!pile) return { ok: false, error: '未找到桩' }
-  if (pile.onlineState !== 'online') return { ok: false, error: '请先连接平台（桩需在线）' }
+  if (!pile) return fail('未找到桩')
+  if (pile.onlineState !== 'online') return fail('请先连接平台（桩需在线）')
   const gun = pile.guns.find((g) => g.gunId === gunId)
-  if (!gun) return { ok: false, error: '未找到充电枪' }
+  if (!gun) return fail('未找到充电枪')
   const vin = String(gun.vin ?? '').trim().toUpperCase()
-  if (vin.length < 8) return { ok: false, error: '请先填写有效 VIN（至少 8 位）' }
-  if (gun.status === 'charging' || gun.status === 'occupied') return { ok: false, error: '当前枪占用或充电中，无法重复发起' }
-  if (gun.status !== 'linked') return { ok: false, error: '枪需为「链接」状态（请先连接车辆）' }
+  if (vin.length < 8) return fail('请先填写有效 VIN（至少 8 位）')
+  if (gun.status === 'charging' || gun.status === 'occupied') return fail('当前枪占用或充电中，无法重复发起')
+  if (gun.status !== 'linked') return fail('枪需为「链接」状态（请先连接车辆）')
 
   const remote = `${pile.tcpHost ?? '127.0.0.1'}:${pile.tcpPort ?? 9000}`
   /** VIN 启动：`0x40` 充电订单号域默认全 0；平台在 `0x41` 等后续报文分配或回显订单号 */
@@ -2746,7 +3161,7 @@ export async function runVinAuthRemoteStart(pileId: string, gunId: string): Prom
     },
   })
   if (!isOk(ret)) {
-    return { ok: false, error: String(ret.error ?? '等待 0x41 超时或发送失败') }
+    return fail(String(ret.error ?? '等待 0x41 超时或发送失败'))
   }
   const body = String(ret.dataHex ?? '').replace(/[^0-9a-f]/gi, '').toLowerCase()
   const parsed = parseVinAuth41Payload(body)
@@ -2765,16 +3180,19 @@ export async function runVinAuthRemoteStart(pileId: string, gunId: string): Prom
     },
   })
   if (!parsed) {
-    return { ok: false, error: '0x41 报文解析失败' }
+    return fail('0x41 报文解析失败')
   }
 
-  const authOk = parsed.allowChargeFlag === 1
+  const authOk = isVin41AllowCharge(parsed.allowChargeFlag)
   const cfg = remoteConfigForPile(pileId)
   /** 鉴权未通过、或模拟器配置启动失败：不上送 0x23/0x33 */
   const excludeFromOrderPush = !authOk || cfg.startResult === 2
 
   const orderNo = generateVinLedOrderNo()
-  const tariffSnapshot = tariffSnapshotForVin41Order(pile, parsed.embeddedTariffModel, parsed.billingModelSelect)
+  const pendingEmbeddedTariff =
+    parsed.billingModelSelect === 2 && parsed.embeddedTariffModel
+      ? pendingEmbeddedFromModel(parsed.embeddedTariffModel)
+      : undefined
 
   const baseOrder: JxPileOrder = {
     orderNo,
@@ -2788,7 +3206,6 @@ export async function runVinAuthRemoteStart(pileId: string, gunId: string): Prom
     failReasonCode: authOk ? undefined : parsed.prohibitReason,
     failReasonText: authOk ? undefined : vinAuthProhibitReasonText(parsed.prohibitReason),
     excludeFromOrderPush,
-    tariffSnapshot,
     request23: {
       vin: parsed.vin || vin,
       userType: 6,
@@ -2800,17 +3217,143 @@ export async function runVinAuthRemoteStart(pileId: string, gunId: string): Prom
       billingModelSelect: parsed.billingModelSelect,
       billingModelSelect1f: parsed.billingModelSelect,
       accountBalanceFen: parsed.accountBalanceFen,
-      tariffModelVersionAtStart: tariffSnapshot.version,
+      pendingEmbeddedTariff,
     },
     process25: [],
     process30: [],
   }
   orderStore.upsertOrder(baseOrder)
 
-  dispatchVinAuth21After41(pile, pileId, gunId, orderNo, authOk, parsed, remote)
+  if (!authOk) {
+    return fail(`平台禁止充电（${vinAuthProhibitReasonText(parsed.prohibitReason)}）`)
+  }
+
+  dispatchVinAuth21After41(pile, pileId, gunId, orderNo, true, parsed, remote)
+
+  if (cfg.startResult === 2) {
+    return fail(failReasonText(cfg.failReason))
+  }
+  return { ok: true }
+}
+
+/**
+ * 卡鉴权启动：上行 `0x19` 并等待 `0x1A`；允许充电时以 `0x1A` 订单号建单并上送 `0x21`，等待 `0x22` 后走既有充电流程。
+ */
+export async function runCardAuthRemoteStart(
+  pileId: string,
+  gunId: string,
+  cardNo: string,
+): Promise<{ ok: boolean; error?: string }> {
+  ensureTcpEventListener()
+  const topo = useJxTopologyStore()
+  const orderStore = useJxOrderStore()
+  const logs = useJxRuntimeLogStore()
+  const pile = topo.piles.find((x) => x.pileId === pileId)
+  if (!pile) return { ok: false, error: '未找到桩' }
+  if (pile.onlineState !== 'online') return { ok: false, error: '请先连接平台（桩需在线）' }
+  const gun = pile.guns.find((g) => g.gunId === gunId)
+  if (!gun) return { ok: false, error: '未找到充电枪' }
+  const card = cardNo.trim()
+  if (!card) return { ok: false, error: '请输入卡号' }
+  if (gun.status === 'charging' || gun.status === 'occupied') {
+    return { ok: false, error: '当前枪占用或充电中，无法重复发起' }
+  }
+  if (gun.status !== 'linked') return { ok: false, error: '枪需为「链接」状态（请先连接车辆）' }
+
+  const remote = `${pile.tcpHost ?? '127.0.0.1'}:${pile.tcpPort ?? 9000}`
+  const payload19 = buildCardAuth19Payload(pile, gunId, card)
+  const ret = await tcpInvoke('send', {
+    pileId,
+    cmd: '0x19',
+    pileNo: pile.pileId,
+    dataHex: payload19,
+    expectCmds: ['0x1a'],
+    timeoutMs: 15000,
+  })
+  logs.appendLog(pileId, {
+    t: Date.now(),
+    pileId,
+    command: '0x19',
+    direction: 'send',
+    remoteIp: remote,
+    rawHex: toHexPairs(String(ret.requestFrameHex ?? '')),
+    structured: {
+      type: 'card-auth-request',
+      requestDataHex: payload19,
+      decoded: decodeCmdPayload('0x19', payload19),
+      ok: ret.ok === true,
+      error: ret.ok === true ? undefined : String(ret.error ?? ''),
+    },
+  })
+  if (!isOk(ret)) {
+    return { ok: false, error: String(ret.error ?? '等待 0x1A 超时或发送失败') }
+  }
+  const body = String(ret.dataHex ?? '').replace(/[^0-9a-f]/gi, '').toLowerCase()
+  const parsed = parseCardAuth1aPayload(body)
+  logs.appendLog(pileId, {
+    t: Date.now(),
+    pileId,
+    command: '0x1a',
+    direction: 'receive',
+    remoteIp: remote,
+    rawHex: toHexPairs(String(ret.frameHex ?? '')),
+    structured: {
+      type: 'card-auth-reply',
+      responseDataHex: body,
+      decoded: parsed ? decodeCmdPayload('0x1a', body) : { parseError: 'invalid 0x1a' },
+      ok: parsed !== null,
+    },
+  })
+  if (!parsed) {
+    return { ok: false, error: '0x1A 报文解析失败' }
+  }
+
+  const authOk = parsed.allowChargeFlag === 1
+  const cfg = remoteConfigForPile(pileId)
+  const excludeFromOrderPush = !authOk || cfg.startResult === 2
+
+  const orderNoRaw = parsed.orderNo?.trim() ?? ''
+  const orderNo = orderNoRaw || `CARD-${Date.now()}`
+  const pendingEmbeddedTariff =
+    parsed.billingModelSelect === 2 && parsed.embeddedTariffModel
+      ? pendingEmbeddedFromModel(parsed.embeddedTariffModel)
+      : undefined
+  const balanceYuan = parsed.accountBalanceFen / 100
+
+  const baseOrder: JxPileOrder = {
+    orderNo,
+    pileId,
+    gunId,
+    startAuthSource: '0x19-card',
+    startType: 'immediate',
+    startParam: `卡启动 卡号=${parsed.cardNo || card} billing=${parsed.billingModelSelect}`,
+    startAt: Date.now(),
+    status: authOk ? 'start-accepted' : 'failed',
+    failReasonCode: authOk ? undefined : parsed.prohibitReason,
+    failReasonText: authOk ? undefined : cardAuthProhibitReasonText(parsed.prohibitReason),
+    excludeFromOrderPush,
+    request23: {
+      userType: 3,
+      userId: parsed.cardNo || card,
+      controlMode: 4,
+      controlParam: 0,
+      chargeMode: 1,
+      startMode: 1,
+      billingModelSelect: parsed.billingModelSelect,
+      billingModelSelect1f: parsed.billingModelSelect,
+      accountBalanceFen: parsed.accountBalanceFen,
+      chargingCardBalanceYuan: balanceYuan,
+      pendingEmbeddedTariff,
+    },
+    process25: [],
+    process30: [],
+  }
+  orderStore.upsertOrder(baseOrder)
+
+  dispatchCardAuth21After1a(pile, pileId, gunId, orderNo, authOk, parsed, remote)
 
   if (!authOk) {
-    return { ok: false, error: `鉴权未通过：${vinAuthProhibitReasonText(parsed.prohibitReason)}` }
+    return { ok: false, error: `鉴权未通过：${cardAuthProhibitReasonText(parsed.prohibitReason)}` }
   }
   if (cfg.startResult === 2) {
     return { ok: false, error: `启动失败：${failReasonText(cfg.failReason)}` }
@@ -2969,20 +3512,6 @@ export async function executeFlow(payload: ExecuteFlowPayload): Promise<{ ok: bo
     const qrFrom01 = cmdAfter01 === '0x04' ? parseQrCodesFrom04(String(send01.dataHex ?? '')) : null
     if (qrFrom01) {
       bindQrCodesToPile(payload.pileId, qrFrom01.qrGunCodes)
-      logs.appendLog(payload.pileId, {
-        t: Date.now(),
-        pileId: payload.pileId,
-        command: '0x04',
-        direction: 'receive',
-        remoteIp: `${host}:${port}`,
-        rawHex: '',
-        structured: {
-          type: 'qr-associated',
-          allowFlag: qrFrom01.allowFlag,
-          qrCount: qrFrom01.qrGunCodes.length,
-          detail: '已按001..N顺序写入枪二维码',
-        },
-      })
     }
 
     const loginAbnormalRef = resolveLoginAbnormalTimeRef(payload.params)

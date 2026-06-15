@@ -6,6 +6,8 @@ import App from './App.vue'
 import { router } from './router'
 import { bindAppRouter } from './navigation'
 import './style.css'
+/** um-shell-layers v1 — 回滚时删除下一行 */
+import './styles/um-shell-layers.css'
 
 import 'element-plus/dist/index.css'
 import 'element-plus/theme-chalk/dark/css-vars.css'

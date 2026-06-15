@@ -1,5 +1,10 @@
 /// <reference types="vite/client" />
 
+declare module '*.md?raw' {
+  const content: string
+  export default content
+}
+
 import type { InstalledPluginRecord } from '@shared/plugin-contract'
 import type { CecLogEntry } from '@shared/cec-types'
 import type { LicenseActivateResult, LicenseStatus } from '@shared/license-types'
@@ -49,7 +54,10 @@ declare global {
           | 'queryStationStatus'
           | 'clientStartCharge'
           | 'clientStopCharge'
-          | 'syncOrderStatus',
+          | 'clientQueryTerminalCode'
+          | 'syncOrderStatus'
+          | 'clearInboundToken'
+          | 'clearThirdPartyToken',
         data?: unknown,
       ) => Promise<{ ok: boolean; error?: string }>
       jxTcpInvoke: (

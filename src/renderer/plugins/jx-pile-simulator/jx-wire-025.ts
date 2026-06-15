@@ -5,6 +5,14 @@
  */
 import type { JxChargeElectricalSample } from './jx-charge-electrical-model'
 import type { JxPileOrder, JxTopologyPile } from './types'
+import {
+  makeTimeTag6HexFromMs,
+  mergeChargingPeriodEnergySegments,
+  periodSegmentToLatest25View,
+  periodsFromOrderTariff,
+  splitOrderEnergyByTariffPeriods,
+  type OrderPeriodEnergySegment,
+} from './jx-order-period-split'
 import { WIRE_SCALE } from './jx-wire-scale'
 
 export { WIRE_SCALE } from './jx-wire-scale'
@@ -12,6 +20,7 @@ export { WIRE_SCALE } from './jx-wire-scale'
 export type Build025WireResult = {
   payload: string
   snapshot: NonNullable<JxPileOrder['latest25']>
+  periodEnergySegments: OrderPeriodEnergySegment[]
 }
 
 function timeByteHex(n: number): string {
@@ -84,23 +93,8 @@ function decodeU32Le(hex: string): number {
   return ((b3 << 24) | (b2 << 16) | (b1 << 8) | b0) >>> 0
 }
 
-function periodsForOrder25(
-  order: JxPileOrder,
-  pile: JxTopologyPile,
-): Array<{ startHour: number; startMinute: number; electricRate: number; serviceRate: number }> {
-  const snap = order.tariffSnapshot
-  const fallback = [{ startHour: 0, startMinute: 0, electricRate: 0.8, serviceRate: 0.2 }]
-  const src = snap?.periods?.length
-    ? snap.periods
-    : pile.tariffModel?.periods?.length
-      ? pile.tariffModel.periods
-      : fallback
-  return src.map((p) => ({
-    startHour: p.startHour,
-    startMinute: p.startMinute,
-    electricRate: p.electricRate,
-    serviceRate: p.serviceRate,
-  }))
+function periodsForOrder25(order: JxPileOrder) {
+  return periodsFromOrderTariff(order)
 }
 
 function gunIdToGunNoHex(pile: JxTopologyPile, gunId: string): string {
@@ -215,49 +209,57 @@ export function build025PayloadWire(
   const encoder = resolve025WireAdapter(pile.protocolId)
   const gunNoHex = gunIdToGunNoHex(pile, order.gunId)
   const energyKwh = Math.max(0, sample.energyKwh)
-  const now = new Date()
-  const normalizedPeriods = periodsForOrder25(order, pile).map((x, idx) => ({
-    modelIndex: idx,
-    startHour: x.startHour,
-    startMinute: x.startMinute,
-    electricRate: x.electricRate,
-    serviceRate: x.serviceRate,
-  }))
-  const currentMinutes = now.getHours() * 60 + now.getMinutes()
-  const periodStarts = normalizedPeriods
-    .map((x) => ({ ...x, minutes: x.startHour * 60 + x.startMinute }))
-    .sort((a, b) => a.minutes - b.minutes)
-  let active = periodStarts[periodStarts.length - 1]
-  for (const p of periodStarts) {
-    if (currentMinutes >= p.minutes) active = p
-    else break
-  }
-  const unitPrice = Math.max(0.01, active.electricRate + active.serviceRate)
-  const amountYuan = Math.max(0.01, energyKwh * unitPrice)
+  const durationSec = Math.max(1, Math.round(sample.tick * Math.max(1, workInfoSec)))
+  const chargeEndMs = Date.now()
+  const chargeStartMs = order.startAt > 0 ? order.startAt : chargeEndMs - durationSec * 1000
+
+  const freshSplit = splitOrderEnergyByTariffPeriods({
+    periods: periodsForOrder25(order),
+    chargeStartMs,
+    chargeEndMs,
+    totalEnergyKwh: energyKwh,
+  })
+
+  const mergedSegments = mergeChargingPeriodEnergySegments(order.periodEnergySegments ?? [], freshSplit)
+
+  const electricFeeYuan = mergedSegments.reduce((s, x) => s + x.electricFeeYuan, 0)
+  const serviceFeeYuan = mergedSegments.reduce((s, x) => s + x.serviceFeeYuan, 0)
+  const amountYuan = Math.max(0.01, electricFeeYuan + serviceFeeYuan)
+
   const targetAmountYuan =
     order.request23?.controlMode === 3 ? Math.max(0, (order.request23?.controlParam ?? 0) * 0.01) : 0
   const initialBalanceYuan = (order.request23?.accountBalanceFen ?? 500000) / 100
   const accountBalanceYuan =
     targetAmountYuan > 0 ? Math.max(0, targetAmountYuan - amountYuan) : Math.max(0, initialBalanceYuan - amountYuan)
-  const durationSec = Math.max(1, Math.round(sample.tick * Math.max(1, workInfoSec)))
-  const segStart = makeTimeTag6Hex(new Date(order.startAt))
-  const segEnd = makeTimeTag6Hex(now)
 
-  const segmentRow = {
-    modelIndex: active.modelIndex,
-    segStartHex: segStart,
-    segEndHex: segEnd,
-    electricPrice: active.electricRate,
-    servicePrice: active.serviceRate,
-    segmentEnergyKwh: energyKwh,
-    segmentElectricFeeYuan: Math.round(energyKwh * active.electricRate * WIRE_SCALE.TWO_POINT) / WIRE_SCALE.TWO_POINT,
-    segmentServiceFeeYuan: Math.round(energyKwh * active.serviceRate * WIRE_SCALE.TWO_POINT) / WIRE_SCALE.TWO_POINT,
-    displayStartTime: decodeTimeTag6(segStart),
-    displayEndTime: decodeTimeTag6(segEnd),
-  }
-
-  const electricFeeYuan = Math.round(energyKwh * active.electricRate * WIRE_SCALE.TWO_POINT) / WIRE_SCALE.TWO_POINT
-  const serviceFeeYuan = Math.round(energyKwh * active.serviceRate * WIRE_SCALE.TWO_POINT) / WIRE_SCALE.TWO_POINT
+  const wireSegments =
+    mergedSegments.length > 0
+      ? mergedSegments.map((seg) => ({
+          modelIndex: seg.modelIndex,
+          segStartHex: makeTimeTag6HexFromMs(seg.startMs),
+          segEndHex: makeTimeTag6HexFromMs(seg.endMs),
+          electricPrice: seg.electricRate,
+          servicePrice: seg.serviceRate,
+          segmentEnergyKwh: seg.energyKwh,
+          segmentElectricFeeYuan: seg.electricFeeYuan,
+          segmentServiceFeeYuan: seg.serviceFeeYuan,
+          displayStartTime: seg.startTime,
+          displayEndTime: seg.endTime,
+        }))
+      : [
+          {
+            modelIndex: 0,
+            segStartHex: makeTimeTag6HexFromMs(chargeStartMs),
+            segEndHex: makeTimeTag6HexFromMs(chargeEndMs),
+            electricPrice: 0.8,
+            servicePrice: 0.2,
+            segmentEnergyKwh: energyKwh,
+            segmentElectricFeeYuan: roundMoney(energyKwh * 0.8),
+            segmentServiceFeeYuan: roundMoney(energyKwh * 0.2),
+            displayStartTime: decodeTimeTag6(makeTimeTag6HexFromMs(chargeStartMs)),
+            displayEndTime: decodeTimeTag6(makeTimeTag6HexFromMs(chargeEndMs)),
+          },
+        ]
 
   const { payload, snapshot } = encoder({
     gunNoHex,
@@ -271,8 +273,19 @@ export function build025PayloadWire(
     serviceFeeYuan,
     orderNo: order.orderNo,
     accountBalanceYuan,
-    segments: [segmentRow],
+    segments: wireSegments,
   })
 
-  return { payload, snapshot }
+  return {
+    payload,
+    snapshot: {
+      ...snapshot,
+      segments: mergedSegments.map(periodSegmentToLatest25View),
+    },
+    periodEnergySegments: mergedSegments,
+  }
+}
+
+function roundMoney(y: number): number {
+  return Math.round(y * WIRE_SCALE.TWO_POINT) / WIRE_SCALE.TWO_POINT
 }

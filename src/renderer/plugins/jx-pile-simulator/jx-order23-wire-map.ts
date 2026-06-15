@@ -134,6 +134,22 @@ function gunIdToGunNoHex(pile: JxTopologyPile, gunId: string): string {
   return Math.max(0, Math.min(255, gunNo)).toString(16).padStart(2, '0')
 }
 
+/** 0x23/0x33 时段循环：优先订单分段电量表，按时间顺序记录（重复索引不合并）；协议最多 20 段 */
+function resolveOrder23WireSegments(order: JxPileOrder): Array<{ modelIndex: number; energyKwh: number }> {
+  const fromTable = order.periodEnergySegments ?? []
+  const src =
+    fromTable.length > 0
+      ? fromTable
+      : (order.latest25?.segments ?? []).map((x) => ({
+          modelIndex: x.modelIndex,
+          energyKwh: x.energyKwh,
+        }))
+  return src
+    .filter((x) => x.energyKwh > 0)
+    .slice(0, 20)
+    .map((x) => ({ modelIndex: x.modelIndex, energyKwh: x.energyKwh }))
+}
+
 /** 上行推送：按桩协议拼接 `0x23`/`0x33` 数据域（不含帧头） */
 export function encodeOrder23Or33Payload(
   order: JxPileOrder,
@@ -178,13 +194,12 @@ export function encodeOrder23Or33Payload(
   const modelVersion = u32LeHex(
     order.tariffSnapshot?.version ??
       order.request23?.tariffModelVersionAtStart ??
-      pile?.tariffModel?.version ??
       DEFAULT_TARIFF_MODEL_VERSION,
   )
   const eleFee = u32LeHex(Math.round((order.latest25?.electricFeeYuan ?? 0) * 100))
   const svcFee = u32LeHex(Math.round((order.latest25?.serviceFeeYuan ?? 0) * 100))
   const parkFee = u32LeHex(0)
-  const segmentsWithEnergy = (order.latest25?.segments ?? []).filter((x) => x.energyKwh > 0)
+  const segmentsWithEnergy = resolveOrder23WireSegments(order)
   const segCountNum = Math.min(20, Math.max(1, segmentsWithEnergy.length))
   const segCount = segCountNum.toString(16).padStart(2, '0')
 

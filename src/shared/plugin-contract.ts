@@ -19,6 +19,8 @@ export interface PluginManifest {
   name: string
   version: string
   entry: string
+  /** 相对插件根目录的产品介绍 Markdown 路径，如 docs/user-manual.md */
+  introDoc?: string
   permissions?: string[]
 }
 
@@ -27,6 +29,7 @@ export interface ProtocolSimulatorPlugin {
   meta: PluginMeta
   homeCard: HomeCardDescriptor
   MainView: Component
+  introMarkdown?: string
   SettingsView?: Component
 }
 
@@ -37,4 +40,6 @@ export interface InstalledPluginRecord {
   version: string
   rootPath: string
   entryRelative: string
+  /** 产品介绍 Markdown 相对路径（来自 manifest.introDoc） */
+  introDoc?: string
 }

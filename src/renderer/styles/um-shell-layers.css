@@ -1,0 +1,87 @@
+/**
+ * um-shell-layers v1 — 顶栏壳层 + 内容工作区面板
+ *
+ * ROLLBACK:
+ * 1. 删除本文件
+ * 2. 从 main.ts 移除 import './styles/um-shell-layers.css'
+ * 3. 还原 ShellMenu.vue 中 um-shell-chrome 包裹（见 um-layer-chrome 标记）
+ * 4. 各视图将 um-page-shell / um-workspace-panel 还原为原 px/pt 容器
+ * 5. 参考 docs/um-shell-layers-rollback.md
+ */
+
+:root {
+  --um-chrome-bg: var(--um-surface);
+  --um-chrome-elevated: var(--um-surface-2);
+  --um-canvas-bg: var(--um-bg);
+  --um-workspace-bg: var(--um-surface);
+  --um-shell-bar-height: 2.75rem;
+  --um-shell-chrome-height: calc(var(--space-lg) * 2 + var(--um-shell-bar-height));
+  --um-shell-content-gap: var(--space-md);
+  --um-shell-content-top: calc(var(--um-shell-chrome-height) + var(--um-shell-content-gap));
+  /** 画布与窗口边缘：与顶栏下间距一致 */
+  --um-shell-canvas-inset: var(--um-shell-content-gap);
+  /** 工作区面板边框与内部内容（含插件） */
+  --um-workspace-inner-gap: var(--space-md);
+  --um-chrome-shadow:
+    0 1px 0 color-mix(in oklab, var(--um-border) 85%, transparent),
+    0 6px 20px color-mix(in oklab, var(--um-text) 7%, transparent);
+  --um-workspace-shadow: 0 8px 24px color-mix(in oklab, var(--um-text) 6%, transparent);
+}
+
+:root:not(.dark) {
+  --um-chrome-shadow: 0 1px 0 var(--um-border);
+  --um-workspace-shadow: none;
+}
+
+/* um-layer-chrome: 顶栏托盘 */
+.um-shell-chrome {
+  background: var(--um-chrome-bg);
+  box-shadow: var(--um-chrome-shadow);
+}
+
+.um-shell-chrome__inner {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 0.75rem;
+  padding: var(--space-lg);
+  box-sizing: border-box;
+}
+
+/* um-layer-canvas: 页面画布底色 */
+.um-canvas-main {
+  background: var(--um-canvas-bg);
+}
+
+/* um-layer-page-shell: 内容区外边距与顶距 */
+.um-page-shell {
+  box-sizing: border-box;
+  min-height: 100vh;
+  padding: var(--um-shell-content-top) var(--um-shell-canvas-inset) var(--um-shell-canvas-inset);
+  background: var(--um-canvas-bg);
+}
+
+/* um-layer-workspace: 工作区圆角面板 */
+.um-workspace-panel {
+  box-sizing: border-box;
+  border: 1px solid var(--um-border);
+  border-radius: var(--um-radius);
+  background: var(--um-workspace-bg);
+  box-shadow: var(--um-workspace-shadow);
+  padding: var(--space-lg);
+}
+
+.um-workspace-panel--fill {
+  display: flex;
+  min-height: calc(100vh - var(--um-shell-content-top) - var(--um-shell-canvas-inset));
+  flex-direction: column;
+  overflow: hidden;
+  padding: var(--um-workspace-inner-gap);
+}
+
+.um-workspace-panel--fill > * {
+  flex: 1;
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+}

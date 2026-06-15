@@ -1,5 +1,6 @@
 ﻿<script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onActivated, onBeforeUnmount, onDeactivated, onMounted, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import * as echarts from 'echarts'
 import QRCode from 'qrcode'
@@ -10,11 +11,17 @@ import {
   executeFlow,
   ensureTcpEventListener,
   forceStopOrderCharging,
+  forceCompleteOrder,
+  isLiveChargingOrder,
   pushTeleSignalOnStateChange,
   resetJxPileSessionOnDisconnect,
   runVinAuthRemoteStart,
+  runCardAuthRemoteStart,
+  formatVinStartFailureMessage,
+  JX_VIN_AUTH_DENIED_EVENT,
   setRemoteStartConfig,
   setScanQrVinStartConfig,
+  setActiveListenFlow,
 } from './protocol-executor'
 import { getDisconnectBlockReason } from './disconnect-guard'
 import { useJxOrderStore } from './useJxOrderStore'
@@ -22,6 +29,13 @@ import { usePluginWindowStore } from '@renderer/stores/pluginWindow'
 import type { JxPileOrder } from './types'
 import chargePileSvg from './assets/charge-pile.svg'
 import carSvg from './assets/car.svg'
+import JxBoardList from './JxBoardList.vue'
+import JxRatePopover from './JxRatePopover.vue'
+import {
+  computeRowLayout,
+  pileColumnWidth,
+  splitPilesIntoRowsByWidth,
+} from './jx-topology-layout'
 
 const protocolStore = useJxProtocolStore()
 const topologyStore = useJxTopologyStore()
@@ -30,6 +44,7 @@ const orderStore = useJxOrderStore()
 const pluginWindow = usePluginWindowStore()
 
 const PLUGIN_ID = 'jx-pile-simulator'
+const route = useRoute()
 
 const drawerTab = ref<'basic' | 'control' | 'orders' | 'logs'>('basic')
 const selectedFlowId = ref<string>('')
@@ -47,10 +62,19 @@ const qrDialogText = ref<string>('')
 const qrDialogLoading = ref(false)
 const qrDialogPileId = ref('')
 const qrDialogGunId = ref('')
-const qrDialogTab = ref<'scan' | 'vin'>('scan')
+const qrDialogTab = ref<'scan' | 'vin' | 'card'>('scan')
+/** 启动控制弹窗主面板：启动控制 / 充电信息 */
+const qrDialogPanel = ref<'start' | 'charging'>('start')
+/** 为 true 时面板切换使用左右滑动过渡 */
+const qrDialogPanelSlide = ref(false)
+/** 充电信息面板每秒刷新时长等实时字段 */
+const chargingInfoClock = ref(Date.now())
+let chargingInfoClockTimer: ReturnType<typeof setInterval> | null = null
 const startControlVinDraft = ref('')
 const startControlVinEditing = ref(false)
 const vinAuthBusy = ref(false)
+const cardAuthBusy = ref(false)
+const startControlCardDraft = ref('')
 const qrCache = new Map<string, string>()
 
 const flowParams = ref<Record<string, string>>({
@@ -133,6 +157,27 @@ const activeFlow = computed(() =>
   protocolStore.activeProtocol?.flowTemplates.find((x) => x.flowId === selectedFlowId.value),
 )
 
+const isRemoteStartFlowSelected = computed(
+  () => selectedFlowId.value === 'remote-start' || selectedFlowId.value === 'scan-qr-remote-start',
+)
+const isCardStartFlowSelected = computed(() => selectedFlowId.value === 'card-start')
+
+/** 桩控制流程下拉中隐藏（流程定义与监听逻辑保留） */
+const FLOW_IDS_HIDDEN_FROM_CONTROL_SELECT = new Set(['remote-start', 'remote-start-vin-auth'])
+
+const selectableFlowTemplates = computed(() => {
+  const flows = protocolStore.activeProtocol?.flowTemplates ?? []
+  return flows.filter((f) => !FLOW_IDS_HIDDEN_FROM_CONTROL_SELECT.has(f.flowId))
+})
+
+function ensureSelectableFlowSelected() {
+  const list = selectableFlowTemplates.value
+  if (!list.length) return
+  if (!selectedFlowId.value || FLOW_IDS_HIDDEN_FROM_CONTROL_SELECT.has(selectedFlowId.value)) {
+    selectedFlowId.value = list[0].flowId
+  }
+}
+
 function resolveLoginFlowForPile(pile: { protocolId: string } | null | undefined) {
   if (!pile) return null
   const pid = (pile.protocolId || protocolStore.activeProtocol.protocolId).trim()
@@ -166,10 +211,160 @@ const pilesAfterType = computed(() => {
   return list.filter((p) => (p.deviceKind ?? 'dc') === filterDeviceType.value)
 })
 
-const visiblePiles = computed(() => pilesAfterType.value.slice(0, 10))
-const hiddenPileCount = computed(() => Math.max(0, pilesAfterType.value.length - 10))
-const topologyColumns = computed(() => `repeat(${Math.max(visiblePiles.value.length, 1)}, minmax(92px, 1fr))`)
-const drawerVisible = computed(() => !!topologyStore.activePile)
+const visiblePiles = computed(() => pilesAfterType.value)
+
+const topologyBoardRef = ref<HTMLElement | null>(null)
+const topologyContainerWidth = ref(0)
+let topologyResizeObserver: ResizeObserver | null = null
+let topologyWindowResizeHandler: (() => void) | null = null
+let topologyWidthRetryRaf: number | null = null
+
+const isPluginPaneVisible = computed(
+  () => route.name === 'plugin' && String(route.params.pluginId ?? '').trim() === PLUGIN_ID,
+)
+
+function readTopologyContainerWidth(el: HTMLElement): number {
+  const client = el.clientWidth
+  if (client > 0) return client
+  const rectW = el.getBoundingClientRect().width
+  if (rectW > 0) return rectW
+  const parentW = el.parentElement?.clientWidth ?? 0
+  return parentW > 0 ? parentW : 0
+}
+
+/** 仅在测得有效宽度时更新，避免隐藏/未布局时写入 0 导致整行单排 */
+function updateTopologyContainerWidth() {
+  const el = topologyBoardRef.value
+  if (!el) return
+  const width = readTopologyContainerWidth(el)
+  if (width > 0) {
+    topologyContainerWidth.value = width
+    return
+  }
+  if (topologyWidthRetryRaf != null) return
+  topologyWidthRetryRaf = requestAnimationFrame(() => {
+    topologyWidthRetryRaf = null
+    const retryEl = topologyBoardRef.value
+    if (!retryEl) return
+    const retryWidth = readTopologyContainerWidth(retryEl)
+    if (retryWidth > 0) topologyContainerWidth.value = retryWidth
+  })
+}
+
+function unbindTopologyResizeObserver() {
+  topologyResizeObserver?.disconnect()
+  topologyResizeObserver = null
+  if (topologyWindowResizeHandler) {
+    window.removeEventListener('resize', topologyWindowResizeHandler)
+    topologyWindowResizeHandler = null
+  }
+  if (topologyWidthRetryRaf != null) {
+    cancelAnimationFrame(topologyWidthRetryRaf)
+    topologyWidthRetryRaf = null
+  }
+}
+
+function bindTopologyResizeObserver() {
+  if (boardViewMode.value !== 'topology') return
+  unbindTopologyResizeObserver()
+  const el = topologyBoardRef.value
+  if (!el) return
+  updateTopologyContainerWidth()
+  if (typeof ResizeObserver !== 'undefined') {
+    topologyResizeObserver = new ResizeObserver(() => updateTopologyContainerWidth())
+    topologyResizeObserver.observe(el)
+  }
+  topologyWindowResizeHandler = () => updateTopologyContainerWidth()
+  window.addEventListener('resize', topologyWindowResizeHandler, { passive: true })
+}
+
+const topologyLayoutRows = computed(() => {
+  const width = topologyContainerWidth.value
+  const rowGroups = splitPilesIntoRowsByWidth(visiblePiles.value, width)
+  const groups = rowGroups.length ? rowGroups : [[] as typeof visiblePiles.value]
+  return groups.map((piles) => {
+    const columnWidths = piles.map((p) => pileColumnWidth(p.guns.length))
+    const layout = computeRowLayout(columnWidths, width)
+    const rowStyle = layout.needsScroll
+      ? { '--jx-row-gap': `${layout.gap}px`, width: `${layout.minWidth}px` }
+      : { '--jx-row-gap': `${layout.gap}px`, width: '100%' }
+    return { piles, layout, rowStyle }
+  })
+})
+
+const hiddenPileCount = computed(() => 0)
+
+type BoardViewMode = 'topology' | 'list'
+
+const boardViewMode = ref<BoardViewMode>('topology')
+
+function setBoardViewMode(mode: BoardViewMode) {
+  if (mode === 'topology' && boardViewMode.value === 'list') {
+    topologyStore.activePileId = null
+  }
+  boardViewMode.value = mode
+  if (mode === 'topology') {
+    nextTick(() => bindTopologyResizeObserver())
+  } else {
+    unbindTopologyResizeObserver()
+  }
+}
+
+const VIN_POP_WIDTH = 230
+const vinPopStyle = ref<Record<string, string>>({})
+
+function updateVinPopPosition() {
+  if (!vinEdit.value.visible || boardViewMode.value !== 'topology') return
+  const anchorId = `${vinEdit.value.pileId}-${vinEdit.value.gunId}`
+  const el = document.querySelector(`[data-vin-anchor="${anchorId}"]`)
+  if (!el) return
+  const rect = el.getBoundingClientRect()
+  const half = VIN_POP_WIDTH / 2
+  const margin = 8
+  const centerX = Math.min(
+    Math.max(rect.left + rect.width / 2, half + margin),
+    window.innerWidth - half - margin,
+  )
+  vinPopStyle.value = {
+    top: `${rect.bottom + 8}px`,
+    left: `${centerX}px`,
+  }
+}
+
+let vinPopScrollTarget: HTMLElement | null = null
+
+function bindVinPopScrollListener() {
+  unbindVinPopScrollListener()
+  const el = topologyBoardRef.value
+  if (!el) return
+  vinPopScrollTarget = el
+  el.addEventListener('scroll', updateVinPopPosition, { passive: true })
+  window.addEventListener('resize', updateVinPopPosition, { passive: true })
+}
+
+function unbindVinPopScrollListener() {
+  if (vinPopScrollTarget) {
+    vinPopScrollTarget.removeEventListener('scroll', updateVinPopPosition)
+    vinPopScrollTarget = null
+  }
+  window.removeEventListener('resize', updateVinPopPosition)
+}
+
+watch(
+  () => vinEdit.value.visible,
+  (visible) => {
+    if (visible && boardViewMode.value === 'topology') {
+      nextTick(() => {
+        updateVinPopPosition()
+        bindVinPopScrollListener()
+      })
+    } else {
+      unbindVinPopScrollListener()
+    }
+  },
+)
+/** 侧栏仅拓扑模式展示；列表模式在右侧详区操作，选中桩不弹框 */
+const drawerVisible = computed(() => boardViewMode.value === 'topology' && !!topologyStore.activePile)
 const drawerLeftStyle = computed(() => {
   const idx = visiblePiles.value.findIndex((x) => x.pileId === topologyStore.activePileId)
   const total = visiblePiles.value.length
@@ -202,10 +397,21 @@ const currentOrder23Segments = computed(() => {
   return segs.filter((x) => x.energyKwh > 0)
 })
 
-/** 订单详情「时段电量」：充电中随 `latest25` 刷新；含起止时间、电费、服务费仅作展示，不参与 `0x23`/`0x33` 组包 */
+/** 订单详情「时段电量」：优先分段电量表；充电中末段仅更新结束时间，已结束段保留 */
 const orderPeriodEnergyDisplayRows = computed(() => {
   const o = currentOrderDetail.value
   if (!o) return []
+  const table = o.periodEnergySegments
+  if (table?.length) {
+    return table.map((seg) => ({
+      modelIndex: seg.modelIndex,
+      energyKwh: seg.energyKwh,
+      startTime: seg.startTime,
+      endTime: seg.endTime,
+      electricFeeYuan: seg.electricFeeYuan,
+      serviceFeeYuan: seg.serviceFeeYuan,
+    }))
+  }
   const live = o.latest25?.segments
   if (live?.length) {
     return live.map((seg) => ({
@@ -236,17 +442,52 @@ function closeDrawer() {
   topologyStore.activePileId = null
 }
 
+function notifyVinStartFailure(message: string) {
+  const text = formatVinStartFailureMessage(message)
+  ElMessage.error({ message: text, duration: 6000, showClose: true })
+}
+
+function onVinAuthDeniedEvent(ev: Event) {
+  const detail = (ev as CustomEvent<{ pileId?: string; gunId?: string; message?: string }>).detail
+  const message = String(detail?.message ?? '').trim()
+  if (message) notifyVinStartFailure(message)
+}
+
 onMounted(() => {
   filterProtocol.value = protocolStore.activeProtocolId
-  if (!selectedFlowId.value && protocolStore.activeProtocol.flowTemplates[0]) {
-    selectedFlowId.value = protocolStore.activeProtocol.flowTemplates[0].flowId
-  }
+  ensureSelectableFlowSelected()
+  window.addEventListener(JX_VIN_AUTH_DENIED_EVENT, onVinAuthDeniedEvent as EventListener)
   nowTickTimer = setInterval(() => {
     nowTick.value = Date.now()
   }, 30_000)
+  nextTick(() => bindTopologyResizeObserver())
+})
+
+onActivated(() => {
+  nextTick(() => bindTopologyResizeObserver())
+})
+
+onDeactivated(() => {
+  unbindTopologyResizeObserver()
+})
+
+watch(isPluginPaneVisible, (visible) => {
+  if (visible && boardViewMode.value === 'topology') {
+    nextTick(() => bindTopologyResizeObserver())
+  }
+})
+
+watch(topologyBoardRef, (el) => {
+  if (el && boardViewMode.value === 'topology') {
+    nextTick(() => bindTopologyResizeObserver())
+  }
 })
 
 onBeforeUnmount(() => {
+  window.removeEventListener(JX_VIN_AUTH_DENIED_EVENT, onVinAuthDeniedEvent as EventListener)
+  unbindVinPopScrollListener()
+  unbindTopologyResizeObserver()
+  stopChargingInfoClock()
   // 切换路由时插件仍保留在窗口缓存中，不断开 TCP；仅菜单关闭或应用退出时清理
   if (pluginWindow.isOpen(PLUGIN_ID)) return
   for (const pile of topologyStore.piles) {
@@ -343,6 +584,22 @@ watch(
     setScanQrVinStartConfig(topologyStore.activePileId, cfg)
   },
   { deep: true },
+)
+
+watch(
+  [selectedFlowId, () => topologyStore.activePileId],
+  ([flowId, pileId]) => {
+    if (!pileId) return
+    setActiveListenFlow(pileId, flowId || null)
+  },
+  { immediate: true },
+)
+
+watch(
+  () => protocolStore.activeProtocolId,
+  () => {
+    ensureSelectableFlowSelected()
+  },
 )
 
 watch(
@@ -472,6 +729,11 @@ async function exportProtocol() {
   else ElMessage.error(res.error ?? '导出失败')
 }
 
+function onProtocolMenuCommand(command: 'import' | 'export') {
+  if (command === 'import') void importProtocol()
+  else void exportProtocol()
+}
+
 async function runFlow() {
   if (!activeFlow.value || !topologyStore.activePileId) return
   if (activeFlow.value.flowId !== 'login-auth') {
@@ -580,31 +842,28 @@ async function onPileLinkIndicatorClick(pileId: string) {
   await runLoginFlowByPile(pileId)
 }
 
-async function disconnectActivePile() {
-  const activePile = topologyStore.activePile
-  if (!activePile) {
-    ElMessage.warning('请先选择桩')
-    return
-  }
-  const blockReason = getDisconnectBlockReason(activePile.onlineState, disconnecting.value)
+async function disconnectPileById(pileId: string) {
+  const pile = topologyStore.piles.find((x) => x.pileId === pileId)
+  if (!pile) return
+  const blockReason = getDisconnectBlockReason(pile.onlineState, disconnecting.value)
   if (blockReason) {
     ElMessage.info(blockReason)
     return
   }
   disconnecting.value = true
   try {
-    const ret = (await window.unions.jxTcpInvoke('disconnect', { pileId: activePile.pileId })) as {
+    const ret = (await window.unions.jxTcpInvoke('disconnect', { pileId: pile.pileId })) as {
       ok?: boolean
       error?: string
     }
     if (ret.ok === true) {
-      resetJxPileSessionOnDisconnect(activePile.pileId)
-      logStore.appendLog(activePile.pileId, {
+      resetJxPileSessionOnDisconnect(pile.pileId)
+      logStore.appendLog(pile.pileId, {
         t: Date.now(),
-        pileId: activePile.pileId,
+        pileId: pile.pileId,
         command: 'TCP',
         direction: 'send',
-        remoteIp: `${activePile.tcpHost ?? '127.0.0.1'}:${activePile.tcpPort ?? 9000}`,
+        remoteIp: `${pile.tcpHost ?? '127.0.0.1'}:${pile.tcpPort ?? 9000}`,
         rawHex: '',
         structured: { type: 'manual-disconnect', detail: '用户手动断开连接' },
       })
@@ -615,6 +874,15 @@ async function disconnectActivePile() {
   } finally {
     disconnecting.value = false
   }
+}
+
+async function disconnectActivePile() {
+  const activePile = topologyStore.activePile
+  if (!activePile) {
+    ElMessage.warning('请先选择桩')
+    return
+  }
+  await disconnectPileById(activePile.pileId)
 }
 
 function statusPillLabel(state?: string): string {
@@ -649,10 +917,20 @@ function gunHudCharging(gun: { status: string }): boolean {
   return gun.status === 'charging'
 }
 
+/** 仅充电中展示实时 SOC/电量/金额；桩或枪结束充电后 HUD 归零 */
+function gunHudShowsLiveCharging(pile: { status: string }, gun: { status: string }): boolean {
+  return pile.status === 'charging' && gun.status === 'charging'
+}
+
 /** 充电过程优先用订单 `latestBms.soc`，与拓扑同步 */
-function gunHudSocDisplay(pileId: string, gunId: string, gun: { soc?: number }): string {
+function gunHudSocDisplay(
+  pile: { status: string; pileId: string },
+  gunId: string,
+  gun: { status: string; soc?: number },
+): string {
+  if (!gunHudShowsLiveCharging(pile, gun)) return '-'
   const o = orderStore
-    .listByPile(pileId)
+    .listByPile(pile.pileId)
     .find((x) => x.gunId === gunId && ['charging', 'starting', 'start-accepted'].includes(x.status))
   const s = o?.latestBms?.soc
   if (typeof s === 'number' && Number.isFinite(s)) return `${Math.round(s)}%`
@@ -660,27 +938,82 @@ function gunHudSocDisplay(pileId: string, gunId: string, gun: { soc?: number }):
   return '-'
 }
 
-function gunHudEnergyLine(pileId: string, gunId: string): string {
-  const o = orderStore.listByPile(pileId).find((x) => x.gunId === gunId && x.status === 'charging')
+function gunHudEnergyLine(pile: { status: string; pileId: string }, gunId: string, gun: { status: string }): string {
+  if (!gunHudShowsLiveCharging(pile, gun)) return '-'
+  const o = orderStore.listByPile(pile.pileId).find((x) => x.gunId === gunId && x.status === 'charging')
   const kwh = o?.latest25?.chargeEnergyKwh
   if (typeof kwh === 'number' && Number.isFinite(kwh)) return `${kwh.toFixed(2)}kWh`
   return '-'
 }
 
-function gunHudAmountLine(pileId: string, gunId: string): string {
-  const o = orderStore.listByPile(pileId).find((x) => x.gunId === gunId && x.status === 'charging')
+function gunHudAmountLine(pile: { status: string; pileId: string }, gunId: string, gun: { status: string }): string {
+  if (!gunHudShowsLiveCharging(pile, gun)) return '-'
+  const o = orderStore.listByPile(pile.pileId).find((x) => x.gunId === gunId && x.status === 'charging')
   const y = o?.latest25?.chargeAmountYuan
   if (typeof y === 'number' && Number.isFinite(y)) return `${y.toFixed(2)}元`
   return '-'
 }
 
 function orderTariffTypeLabel(order: JxPileOrder): string {
-  if (order.startAuthSource === '0x40-vin' || order.startAuthSource === '0x59-scan-vin') return 'VIN计费模型'
   const src = order.tariffSnapshot?.source
-  if (src === '0x41-vin-embedded' || src === '0x41-vin-local') return 'VIN计费模型'
+  if (src === '0x1a-embedded') return '卡启动（报文内嵌费率）'
+  if (src === '0x1a-local') return '卡启动（桩本地费率）'
+  if (src === '0x41-vin-embedded') return 'VIN启动（报文内嵌费率）'
+  if (src === '0x41-vin-local') return 'VIN启动（桩本地费率）'
   if (src === '0x1f-embedded') return '远端启动（报文内嵌费率）'
-  if (src === 'pile-0x37') return '桩本地计费模型'
+  if (src === 'pile-0x37') {
+    if (order.startAuthSource === '0x1f-remote') return '远端启动（桩本地费率）'
+    return '桩本地计费模型'
+  }
+  const billing = order.request23?.billingModelSelect1f ?? order.request23?.billingModelSelect
+  if (billing === 2 && order.request23?.pendingEmbeddedTariff) return '报文内嵌费率（待启动生效）'
+  if (order.status === 'charging' || order.status === 'stopped' || order.status === 'starting') {
+    return '桩本地费率（待启动生效）'
+  }
+  if (billing === 1 || billing === undefined) return '桩本地费率（待启动生效）'
   return '-'
+}
+
+const orderTariffDialogVisible = ref(false)
+const orderTariffViewOrderNo = ref('')
+
+const orderTariffViewOrder = computed(() => {
+  const pileId = topologyStore.activePileId
+  if (!pileId || !orderTariffViewOrderNo.value) return null
+  return orderStore.listByPile(pileId).find((x) => x.orderNo === orderTariffViewOrderNo.value) ?? null
+})
+
+const orderTariffViewSnapshot = computed(() => {
+  const order = orderTariffViewOrder.value
+  if (!order) return null
+  if (order.tariffSnapshot) return order.tariffSnapshot
+  const pending = order.request23?.pendingEmbeddedTariff
+  if (!pending) return null
+  const billing = order.request23?.billingModelSelect1f ?? order.request23?.billingModelSelect
+  const source =
+    billing === 2
+      ? order.startAuthSource === '0x19-card'
+        ? '0x1a-embedded'
+        : order.startAuthSource === '0x40-vin' || order.startAuthSource === '0x59-scan-vin'
+          ? '0x41-vin-embedded'
+          : '0x1f-embedded'
+      : 'pile-0x37'
+  return {
+    version: pending.version,
+    parkingRate: pending.parkingRate,
+    periods: pending.periods,
+    source,
+    updatedAt: pending.updatedAt,
+  }
+})
+
+function orderTariffViewable(order: JxPileOrder): boolean {
+  return !!(order.tariffSnapshot || order.request23?.pendingEmbeddedTariff)
+}
+
+function openOrderTariffView(orderNo: string) {
+  orderTariffViewOrderNo.value = orderNo
+  orderTariffDialogVisible.value = true
 }
 
 function gunLabel(pileId: string, gunId: string): string {
@@ -697,15 +1030,156 @@ const startControlGunLabel = computed(() => {
   return gunLabel(p, g)
 })
 
-/** 启动控制弹窗当前枪是否处于充电中（用于展示强制停止入口） */
-const startControlGunCharging = computed(() => {
+const qrDialogTitle = computed(() => (qrDialogPanel.value === 'charging' ? '充电信息' : '启动控制'))
+
+const qrDialogPanelTransition = computed(() =>
+  qrDialogPanelSlide.value ? 'jx-panel-slide-forward' : 'jx-panel-slide-instant',
+)
+
+const startControlChargingOrder = computed((): JxPileOrder | null => {
   const p = qrDialogPileId.value
   const g = qrDialogGunId.value
-  if (!p || !g) return false
-  const pile = topologyStore.piles.find((x) => x.pileId === p)
-  const gun = pile?.guns.find((x) => x.gunId === g)
-  return gun?.status === 'charging'
+  if (!p || !g) return null
+  return orderStore.listByPile(p).find((x) => x.gunId === g && x.status === 'charging') ?? null
 })
+
+function orderStartAuthMethodLabel(order: JxPileOrder | null | undefined): string {
+  const src = order?.startAuthSource
+  if (src === '0x19-card') return '卡启动'
+  if (src === '0x59-scan-vin') return '扫码VIN启动'
+  if (src === '0x40-vin') return 'VIN启动'
+  if (src === '0x1f-remote') return '扫码启动'
+  return '-'
+}
+
+function formatOrderTimestamp(ms?: number): string {
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) return '—'
+  const d = new Date(ms)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+}
+
+function parseProtocolTimeTagToMs(text?: string): number | null {
+  const raw = String(text ?? '').trim()
+  const m = raw.match(/^20(\d{2})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})$/)
+  if (!m) return null
+  const yy = 2000 + Number.parseInt(m[1], 10)
+  const mm = Number.parseInt(m[2], 10) - 1
+  const dd = Number.parseInt(m[3], 10)
+  const HH = Number.parseInt(m[4], 10)
+  const MM = Number.parseInt(m[5], 10)
+  const SS = Number.parseInt(m[6], 10)
+  const t = new Date(yy, mm, dd, HH, MM, SS).getTime()
+  return Number.isFinite(t) ? t : null
+}
+
+function formatChargeDurationSec(totalSec: number): string {
+  const s = Math.max(0, Math.floor(totalSec))
+  const h = Math.floor(s / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  const sec = s % 60
+  if (h > 0) return `${h}小时${m}分${sec}秒`
+  if (m > 0) return `${m}分${sec}秒`
+  return `${sec}秒`
+}
+
+function chargeSessionStartMs(order: JxPileOrder): number {
+  const from23 = parseProtocolTimeTagToMs(order.latest23?.startTime)
+  if (from23) return from23
+  const p25 = order.process25?.[0]?.t
+  if (typeof p25 === 'number' && Number.isFinite(p25)) return p25
+  return order.startAt
+}
+
+const chargingInfoLive = computed(() => {
+  void chargingInfoClock.value
+  const order = startControlChargingOrder.value
+  if (!order) {
+    return {
+      orderNo: '—',
+      startMethod: '—',
+      startTime: '—',
+      vin: '—',
+      isCardStart: false,
+      cardNo: '—',
+      durationText: '—',
+      energyText: '—',
+      balanceText: '—',
+      powerText: '—',
+    }
+  }
+  const pile = topologyStore.piles.find((x) => x.pileId === order.pileId)
+  const gun = pile?.guns.find((x) => x.gunId === order.gunId)
+  const vin =
+    String(order.latest23?.vin ?? order.request23?.vin ?? gun?.vin ?? '').trim() || '—'
+  const isCardStart = order.startAuthSource === '0x19-card'
+  const cardNo = isCardStart
+    ? String(order.request23?.userId ?? order.latest23?.userId ?? '').trim() || '—'
+    : '—'
+  const sessionStart = chargeSessionStartMs(order)
+  const durationSec = Math.max(0, Math.floor((chargingInfoClock.value - sessionStart) / 1000))
+  const energyKwh = order.latest25?.chargeEnergyKwh
+  const energyText =
+    typeof energyKwh === 'number' && Number.isFinite(energyKwh) ? `${energyKwh.toFixed(4)} kWh` : '—'
+  const balanceYuan = order.latest25?.accountBalanceYuan
+  const balanceFrom23 = order.latest23?.chargingCardBalance
+  let balanceText = '—'
+  if (typeof balanceYuan === 'number' && Number.isFinite(balanceYuan)) {
+    balanceText = `${balanceYuan.toFixed(2)} 元`
+  } else if (typeof balanceFrom23 === 'number' && Number.isFinite(balanceFrom23)) {
+    balanceText = `${(balanceFrom23 / 100).toFixed(2)} 元`
+  } else if (typeof order.request23?.chargingCardBalanceYuan === 'number') {
+    balanceText = `${order.request23.chargingCardBalanceYuan.toFixed(2)} 元`
+  }
+  const last25 = order.process25?.at(-1)
+  let powerText = '—'
+  if (last25 && Number.isFinite(last25.voltage) && Number.isFinite(last25.current)) {
+    const kw = (last25.voltage * last25.current) / 1000
+    if (Number.isFinite(kw) && kw >= 0) powerText = `${kw.toFixed(2)} kW`
+  }
+  return {
+    orderNo: order.orderNo.trim() || '—',
+    startMethod: orderStartAuthMethodLabel(order),
+    startTime: formatOrderTimestamp(order.startAt),
+    vin,
+    isCardStart,
+    cardNo,
+    durationText: formatChargeDurationSec(durationSec),
+    energyText,
+    balanceText,
+    powerText,
+  }
+})
+
+function syncQrDialogPanelForGun(pileId: string, gunId: string, animateToCharging = false) {
+  const pile = topologyStore.piles.find((x) => x.pileId === pileId)
+  const gun = pile?.guns.find((x) => x.gunId === gunId)
+  if (!gun) return
+  if (gun.status === 'charging') {
+    if (qrDialogPanel.value !== 'charging') {
+      if (animateToCharging) qrDialogPanelSlide.value = true
+      qrDialogPanel.value = 'charging'
+    }
+  } else if (qrDialogPanel.value === 'charging') {
+    qrDialogPanelSlide.value = false
+    qrDialogPanel.value = 'start'
+  }
+}
+
+function startChargingInfoClock() {
+  if (chargingInfoClockTimer) return
+  chargingInfoClock.value = Date.now()
+  chargingInfoClockTimer = setInterval(() => {
+    chargingInfoClock.value = Date.now()
+  }, 1000)
+}
+
+function stopChargingInfoClock() {
+  if (chargingInfoClockTimer) {
+    clearInterval(chargingInfoClockTimer)
+    chargingInfoClockTimer = null
+  }
+}
 
 function hasTariffModel(pile: (typeof topologyStore.piles)[number]): boolean {
   return !!pile.tariffModel && pile.tariffModel.periods.length > 0
@@ -818,13 +1292,16 @@ async function copyLogByCurrentMode(entry: {
   }
 }
 
-function orderStatusLabel(status: string): string {
+function orderStatusLabel(status: string, failReasonText?: string): string {
   if (status === 'created') return '已创建'
   if (status === 'start-accepted') return '启动受理'
   if (status === 'starting') return '启动中'
   if (status === 'charging') return '充电中'
   if (status === 'failed') return '失败'
-  if (status === 'stopped') return '已停止'
+  if (status === 'stopped') {
+    if (failReasonText === '充电完成' || failReasonText === '强制完成') return '已完成'
+    return '已停止'
+  }
   return status
 }
 
@@ -844,8 +1321,23 @@ function removeOrder(orderNo: string) {
 
 function forceStopOrder(orderNo: string) {
   if (!topologyStore.activePileId) return
-  forceStopOrderCharging(topologyStore.activePileId, orderNo, '急停按下', 1007)
-  ElMessage.success('已强制停止充电订单')
+  const pileId = topologyStore.activePileId
+  const live = isLiveChargingOrder(pileId, orderNo)
+  if (live) {
+    forceStopOrderCharging(pileId, orderNo, '急停按下', 1007)
+    ElMessage.success('已强制停止充电订单')
+  } else {
+    forceCompleteOrder(pileId, orderNo)
+    ElMessage.success('已强制完成订单')
+  }
+}
+
+function forceOrderActionLabel(pileId: string, orderNo: string): string {
+  return isLiveChargingOrder(pileId, orderNo) ? '强制停止' : '强制完成'
+}
+
+function showForceOrderAction(order: JxPileOrder): boolean {
+  return order.status === 'charging' || order.status === 'starting' || order.status === 'start-accepted'
 }
 
 function openOrderDetail(orderNo: string) {
@@ -988,8 +1480,14 @@ const cmdFieldMeta: Record<string, Record<string, FieldMeta>> = {
   },
   '0x04': {
     timeTag: { name: '时间标识', desc: '报文时间戳', decodedKey: 'timeTag', valueType: 'timeTag6' },
-    allowFlag: { name: '请求结果', desc: '1允许/2拒绝', decodedKey: 'allowFlag', enumMap: { 1: '允许', 2: '拒绝' } },
+    allowFlag: {
+      name: '请求结果',
+      desc: '1允许/2拒绝/3允许(含二维码)',
+      decodedKey: 'allowFlag',
+      enumMap: { 1: '允许', 2: '拒绝', 3: '允许(含二维码)' },
+    },
     rejectReason: { name: '拒绝原因', desc: '拒绝原因码', decodedKey: 'rejectReason' },
+    qrGunCount: { name: '二维码数量', desc: 'N', decodedKey: 'qrGunCount', valueType: 'u8' },
   },
   '0x05': {
     timeTag: { name: '时间标识', desc: '桩请求对时的报文时间戳', decodedKey: 'timeTag', valueType: 'timeTag6' },
@@ -1074,6 +1572,24 @@ const cmdFieldMeta: Record<string, Record<string, FieldMeta>> = {
       decodedKey: 'billingModelSelect',
       enumMap: { 1: '本地计费模型', 2: '本报文附带' },
     },
+    tariffModelVersion: {
+      name: '计费模型版本',
+      desc: '计费模型选择=2 时存在',
+      decodedKey: 'tariffModelVersion',
+      valueType: 'u32le',
+    },
+    parkingRate: {
+      name: '停车费费率',
+      desc: '计费模型选择=2 时存在；分辨率0.0001',
+      decodedKey: 'parkingRate',
+      valueType: 'rate4',
+    },
+    periodCount: {
+      name: '时段数 N',
+      desc: '计费模型选择=2 时存在；1~12',
+      decodedKey: 'periodCount',
+      valueType: 'u8',
+    },
   },
   '0x20': {
     timeTag: { name: '时间标识', desc: '报文时间戳', decodedKey: 'timeTag', valueType: 'timeTag6' },
@@ -1119,7 +1635,24 @@ const cmdFieldMeta: Record<string, Record<string, FieldMeta>> = {
       decodedKey: 'billingModelSelect',
       enumMap: { 1: '本地计费模型', 2: '本报文附带' },
     },
-    embeddedTariffBlock: { name: '附带计费扩展', desc: '计费模型选择=2 时存在，结构与0x1F/0x37一致', decodedKey: 'embeddedTariffModel' },
+    tariffModelVersion: {
+      name: '计费模型版本',
+      desc: '计费模型选择=2 时存在',
+      decodedKey: 'tariffModelVersion',
+      valueType: 'u32le',
+    },
+    parkingRate: {
+      name: '停车费费率',
+      desc: '计费模型选择=2 时存在；分辨率0.0001',
+      decodedKey: 'parkingRate',
+      valueType: 'rate4',
+    },
+    periodCount: {
+      name: '时段数 N',
+      desc: '计费模型选择=2 时存在；1~12',
+      decodedKey: 'periodCount',
+      valueType: 'u8',
+    },
     executeResult: { name: '执行结果', desc: '1成功；2失败（对应 CM20 ret）', decodedKey: 'executeResult', enumMap: { 1: '成功', 2: '失败' } },
     failReason: {
       name: '失败原因',
@@ -1163,6 +1696,30 @@ const cmdFieldMeta: Record<string, Record<string, FieldMeta>> = {
     timeTag: { name: '时间标识', desc: '报文时间戳', decodedKey: 'timeTag', valueType: 'timeTag6' },
     gunNo: { name: '枪号', desc: '0~29', decodedKey: 'gunNo' },
     orderNo: { name: '订单号', desc: 'ASCII 32字节', decodedKey: 'orderNo', valueType: 'ascii' },
+  },
+  '0x19': {
+    timeTag: { name: '时间标识', desc: '报文时间戳（6字节）', decodedKey: 'timeTag', valueType: 'timeTag6' },
+    cardNo: { name: '卡号', desc: '16字节ASCII，不足补0', decodedKey: 'cardNo', valueType: 'ascii' },
+    gunNo: { name: '枪号', desc: '0~29', decodedKey: 'gunNo', valueType: 'u8' },
+  },
+  '0x1a': {
+    timeTag: { name: '时间标识', desc: '报文时间戳（6字节）', decodedKey: 'timeTag', valueType: 'timeTag6' },
+    cardNo: { name: '卡号', desc: '与0x19对应', decodedKey: 'cardNo', valueType: 'ascii' },
+    accountBalance: { name: '卡余额', desc: '分辨率0.01元', decodedKey: 'accountBalanceFen', valueType: 'u32le' },
+    allowChargeFlag: {
+      name: '允许充电标志',
+      desc: '1可充电 2禁止',
+      decodedKey: 'allowChargeFlag',
+      enumMap: { 1: '可充电', 2: '禁止充电' },
+    },
+    prohibitReason: { name: '不可充电原因', desc: '禁止时有效', decodedKey: 'prohibitReason', valueType: 'u8' },
+    billingModelSelect: {
+      name: '计费模型选择',
+      desc: '1本地 2本报文附带',
+      decodedKey: 'billingModelSelect',
+      enumMap: { 1: '本地计费模型', 2: '本报文附带' },
+    },
+    orderNo: { name: '充电订单号', desc: '32字节ASCII', decodedKey: 'orderNo', valueType: 'ascii' },
   },
   /** 上行 VIN 鉴权，与 `CM40Data224` 字段顺序一致 */
   '0x40': {
@@ -1433,10 +1990,15 @@ function logFieldRows(entry: { command: string; structured: Record<string, unkno
     const decodedValue = meta?.decodedKey ? decoded[meta.decodedKey] : decoded[key]
     const dynamicMeta = (() => {
       if (!meta && key === 'qrFixedAscii') {
-        return { name: '二维码固定段', desc: 'ASCII 100字节', valueType: 'ascii' as const }
+        return {
+          name: '二维码固定段',
+          desc: 'ASCII 100字节',
+          decodedKey: 'qrFixedAscii',
+          valueType: 'ascii' as const,
+        }
       }
       if (!meta && key === 'qrGunCount') {
-        return { name: '二维码数量', desc: 'N', valueType: 'u8' as const }
+        return { name: '二维码数量', desc: 'N', decodedKey: 'qrGunCount', valueType: 'u8' as const }
       }
       const mGun = key.match(/^qrGun(\d+)Ascii$/)
       if (!meta && mGun) {
@@ -1446,6 +2008,7 @@ function logFieldRows(entry: { command: string; structured: Record<string, unkno
           name: `二维码${gunChar}枪`,
           desc: 'ASCII 100字节，对应充电枪二维码',
           decodedKey: `qrGunCode${idx}`,
+          valueType: 'ascii' as const,
         }
       }
       if (!meta && /^period\d+/.test(key)) {
@@ -1591,10 +2154,17 @@ function openVinDialog(pileId: string, gunId: string) {
     pileId,
     gunId,
   }
+  if (boardViewMode.value === 'topology') {
+    nextTick(() => {
+      updateVinPopPosition()
+      bindVinPopScrollListener()
+    })
+  }
 }
 
 function closeVinEditor() {
   vinEdit.value.visible = false
+  unbindVinPopScrollListener()
 }
 
 /** 根据二维码文本生成/读取缓存图片（无内容则清空图） */
@@ -1627,11 +2197,18 @@ function openStartControlDialog(pileId: string, gunId: string) {
   if (!pile || !gun) return
   qrDialogPileId.value = pileId
   qrDialogGunId.value = gunId
-  qrDialogTab.value = 'scan'
-  startControlVinEditing.value = false
-  startControlVinDraft.value = String(gun.vin ?? '').trim().toUpperCase()
+  qrDialogPanelSlide.value = false
+  if (gun.status === 'charging') {
+    qrDialogPanel.value = 'charging'
+  } else {
+    qrDialogPanel.value = 'start'
+    qrDialogTab.value = 'scan'
+    startControlVinEditing.value = false
+    startControlVinDraft.value = String(gun.vin ?? '').trim().toUpperCase()
+    startControlCardDraft.value = ''
+    void loadStartControlQrImage(String(gun.qrCode ?? ''))
+  }
   qrDialogVisible.value = true
-  void loadStartControlQrImage(String(gun.qrCode ?? ''))
 }
 
 function reloadStartControlVinDraftFromGun() {
@@ -1665,6 +2242,48 @@ watch(qrDialogTab, (t) => {
     reloadStartControlVinDraftFromGun()
   }
 })
+
+watch(
+  () => {
+    const pid = qrDialogPileId.value
+    const gid = qrDialogGunId.value
+    if (!pid || !gid) return 'idle'
+    const pile = topologyStore.piles.find((x) => x.pileId === pid)
+    const gun = pile?.guns.find((x) => x.gunId === gid)
+    return gun?.status ?? 'idle'
+  },
+  (status, prev) => {
+    if (!qrDialogVisible.value) return
+    if (status === 'charging' && prev !== 'charging' && qrDialogPanel.value === 'start') {
+      syncQrDialogPanelForGun(qrDialogPileId.value, qrDialogGunId.value, true)
+    } else if (status !== 'charging' && prev === 'charging' && qrDialogPanel.value === 'charging') {
+      qrDialogPanelSlide.value = false
+      qrDialogPanel.value = 'start'
+      const pile = topologyStore.piles.find((x) => x.pileId === qrDialogPileId.value)
+      const gun = pile?.guns.find((x) => x.gunId === qrDialogGunId.value)
+      if (gun && gun.status !== 'charging') {
+        startControlVinDraft.value = String(gun.vin ?? '').trim().toUpperCase()
+        void loadStartControlQrImage(String(gun.qrCode ?? ''))
+      }
+    }
+  },
+)
+
+watch(
+  [qrDialogVisible, qrDialogPanel],
+  ([visible, panel]) => {
+    if (visible && panel === 'charging') startChargingInfoClock()
+    else stopChargingInfoClock()
+  },
+  { immediate: true },
+)
+
+function onQrDialogClosed() {
+  startControlVinEditing.value = false
+  qrDialogPanelSlide.value = false
+  qrDialogPanel.value = 'start'
+  stopChargingInfoClock()
+}
 
 function disconnectGunLink(pileId: string, gunId: string) {
   const pile = topologyStore.piles.find((x) => x.pileId === pileId)
@@ -1729,9 +2348,28 @@ async function onVinAuthStartFromQr() {
   try {
     const r = await runVinAuthRemoteStart(pid, gid)
     if (r.ok) ElMessage.success('VIN 启动已通过鉴权，已发起充电（0x21）')
-    else ElMessage.error(r.error ?? 'VIN 鉴权启动失败')
+    else notifyVinStartFailure(r.error ?? '未知原因')
   } finally {
     vinAuthBusy.value = false
+  }
+}
+
+async function onCardAuthStartFromDialog() {
+  const pid = qrDialogPileId.value
+  const gid = qrDialogGunId.value
+  if (!pid || !gid) return
+  const card = startControlCardDraft.value.trim()
+  if (!card) {
+    ElMessage.warning('请输入卡号')
+    return
+  }
+  cardAuthBusy.value = true
+  try {
+    const r = await runCardAuthRemoteStart(pid, gid, card)
+    if (r.ok) ElMessage.success('卡鉴权通过，已上送 0x21 启动结果')
+    else ElMessage.error(r.error ?? '卡启动失败')
+  } finally {
+    cardAuthBusy.value = false
   }
 }
 
@@ -1848,12 +2486,57 @@ function confirmAddPile() {
           <el-input v-model="topologyStore.keyword" class="jx-search" placeholder="设备搜索条件" clearable />
         </div>
         <div class="jx-toolbar-actions">
-          <el-button size="small" type="primary" plain :loading="importing" @click="importProtocol">导入协议</el-button>
-          <el-button size="small" @click="exportProtocol">导出协议</el-button>
+          <el-dropdown trigger="click" @command="onProtocolMenuCommand">
+            <button type="button" class="jx-protocol-menu-btn" :disabled="importing">
+              协议
+              <svg class="jx-protocol-menu-caret" viewBox="0 0 24 24" width="12" height="12" aria-hidden="true">
+                <path d="m6 9 6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+            </button>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item command="import" :disabled="importing">导入协议</el-dropdown-item>
+                <el-dropdown-item command="export">导出协议</el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
         </div>
       </header>
 
-      <section class="jx-board">
+      <div class="jx-board-view-bar">
+        <div class="jx-view-toggle" role="group" aria-label="视图切换">
+          <button
+            type="button"
+            class="jx-view-toggle-btn"
+            :class="{ 'is-on': boardViewMode === 'topology' }"
+            @click="setBoardViewMode('topology')"
+          >
+            拓扑
+          </button>
+          <button
+            type="button"
+            class="jx-view-toggle-btn"
+            :class="{ 'is-on': boardViewMode === 'list' }"
+            @click="setBoardViewMode('list')"
+          >
+            列表
+          </button>
+        </div>
+      </div>
+
+      <section v-if="boardViewMode === 'topology'" class="jx-board">
+        <el-tooltip content="添加桩" placement="left">
+          <button
+            type="button"
+            class="jx-add-plus jx-add-plus--float"
+            aria-label="添加桩"
+            @click="openAddDialog"
+          >
+            +
+          </button>
+        </el-tooltip>
+        <div ref="topologyBoardRef" class="jx-board-topology-scroll">
+        <div class="jx-board-topology-inner">
         <div class="jx-hub-wrap">
           <div class="jx-hub" aria-label="协议根节点">
             <span class="jx-hub-cap">{{ protocolLabel }}</span>
@@ -1862,57 +2545,35 @@ function confirmAddPile() {
 
         <div class="jx-main-link" aria-hidden="true" />
 
-        <div class="jx-topology" :style="{ gridTemplateColumns: topologyColumns }">
-          <div class="jx-bus-line" aria-hidden="true" />
-          <el-tooltip content="添加桩" placement="top">
-            <button type="button" class="jx-add-plus" aria-label="添加桩" @click="openAddDialog">
-              +
-            </button>
-          </el-tooltip>
-          <div v-for="pile in visiblePiles" :key="pile.pileId" class="jx-pile-col">
+        <div class="jx-topology-stack">
+          <div
+            v-for="(row, rowIndex) in topologyLayoutRows"
+            :key="`topology-row-${rowIndex}`"
+            class="jx-topology-row-block"
+            :class="{ 'is-scroll': row.layout.needsScroll }"
+            :style="row.rowStyle"
+          >
+          <div class="jx-topology">
+            <div class="jx-bus-line" aria-hidden="true" />
+            <div class="jx-pile-row">
+          <div
+            v-for="pile in row.piles"
+            :key="pile.pileId"
+            class="jx-pile-col"
+            :style="{ width: `${pileColumnWidth(pile.guns.length)}px` }"
+          >
             <div class="jx-drop-up" aria-hidden="true" />
-            <div class="jx-pile-left-info">
-              <div class="jx-pile-id">{{ pile.pileId }}</div>
-              <el-popover placement="left" width="360" trigger="click" popper-class="jx-rate-popover">
-                <template #reference>
-                  <button
-                    type="button"
-                    class="jx-rate-icon"
-                    :class="{ 'is-set': hasTariffModel(pile) }"
-                    title="查看费率信息"
-                  >
-                    ¥
-                  </button>
-                </template>
-                <div class="jx-rate-panel">
-                  <div class="jx-rate-panel-head">
-                    <span>计费模型版本：{{ pile.tariffModel?.version ?? '-' }}</span>
-                    <span>停车费率：{{ formatRate(pile.tariffModel?.parkingRate) }}</span>
-                  </div>
-                  <table v-if="(pile.tariffModel?.periods?.length ?? 0) > 0" class="jx-rate-table">
-                    <thead>
-                      <tr>
-                        <th>时段</th>
-                        <th>类型</th>
-                        <th>电价</th>
-                        <th>服务费</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      <tr v-for="(tp, idx) in pile.tariffModel?.periods ?? []" :key="`${pile.pileId}-tp-${idx}`">
-                        <td class="jx-rate-time-cell">
-                          {{ periodRangeText(pile.tariffModel?.periods ?? [], idx) }}
-                          <span v-if="idx === getCurrentTariffPeriodIndex(pile)" class="jx-current-tag">当前</span>
-                        </td>
-                        <td>{{ tariffTypeLabel(tp.type) }}</td>
-                        <td>{{ formatRate(tp.electricRate) }}</td>
-                        <td>{{ formatRate(tp.serviceRate) }}</td>
-                      </tr>
-                    </tbody>
-                  </table>
-                  <div v-else class="jx-rate-empty">暂无费率数据</div>
-                </div>
-              </el-popover>
+            <div class="jx-pile-id-top">{{ pile.pileId }}</div>
+            <div class="jx-pile-wrap">
+              <div class="jx-pile-left-info">
+              <JxRatePopover
+                :pile="pile"
+                :has-tariff-model="hasTariffModel"
+                :format-rate="formatRate"
+                :period-range-text="periodRangeText"
+                :get-current-tariff-period-index="getCurrentTariffPeriodIndex"
+                :tariff-type-label="tariffTypeLabel"
+              />
               <button
                 v-if="pile.onlineState === 'offline'"
                 type="button"
@@ -1944,7 +2605,6 @@ function confirmAddPile() {
                 </svg>
               </span>
             </div>
-            <div class="jx-pile-wrap">
               <el-tooltip content="删除桩" placement="top">
                 <button
                   type="button"
@@ -1968,11 +2628,17 @@ function confirmAddPile() {
               </button>
             </div>
           </div>
-        </div>
+            </div>
+          </div>
 
-        <div class="jx-car-strip" :style="{ gridTemplateColumns: topologyColumns }">
-          <div v-for="pile in visiblePiles" :key="`car-${pile.pileId}`" class="jx-car-slot">
-            <div class="jx-gun-cluster">
+        <div class="jx-car-strip">
+          <div
+            v-for="pile in row.piles"
+            :key="`car-${pile.pileId}`"
+            class="jx-car-slot"
+            :style="{ width: `${pileColumnWidth(pile.guns.length)}px` }"
+          >
+            <div class="jx-gun-cluster" :class="`is-gun-count-${Math.min(pile.guns.length, 4)}`">
               <div class="jx-car-bus-wrap" aria-hidden="true">
                 <div class="jx-car-bus-drop" />
               </div>
@@ -1988,6 +2654,7 @@ function confirmAddPile() {
                     type="button"
                     class="jx-car-btn"
                     :class="{ 'is-virtual': isVirtualCar(pile.pileId, gun.gunId) }"
+                    :data-vin-anchor="`${pile.pileId}-${gun.gunId}`"
                     @click="handleCarClick(pile.pileId, gun.gunId)"
                   >
                     <svg
@@ -2017,26 +2684,6 @@ function confirmAddPile() {
                       </svg>
                     </span>
                   </button>
-                  <div v-if="vinEdit.visible && vinEdit.pileId === pile.pileId && vinEdit.gunId === gun.gunId" class="jx-vin-pop">
-                  <button type="button" class="jx-vin-close" aria-label="关闭" @click="closeVinEditor">×</button>
-                    <el-input
-                      v-model="vinForm.vin"
-                      size="small"
-                      placeholder="输入VIN"
-                    maxlength="20"
-                      @keyup.enter="confirmLinkCar"
-                    />
-                    <button
-                      type="button"
-                      class="jx-vin-icon-btn"
-                      aria-label="连接车辆"
-                      @click="confirmLinkCar"
-                    >
-                    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
-                        <path d="M8 3v6M12 3v6M6 9h8v3a4 4 0 0 1-4 4H9v4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
-                      </svg>
-                    </button>
-                  </div>
                   <div
                     v-if="pile.onlineState === 'online' && gun.status !== 'idle'"
                     class="jx-car-hud"
@@ -2049,7 +2696,7 @@ function confirmAddPile() {
                           fill="currentColor"
                         />
                       </svg>
-                      <span class="jx-hud-val jx-hud-val--soc">{{ gunHudSocDisplay(pile.pileId, gun.gunId, gun) }}</span>
+                      <span class="jx-hud-val jx-hud-val--soc">{{ gunHudSocDisplay(pile, gun.gunId, gun) }}</span>
                     </div>
                     <div class="jx-hud-cell">
                       <svg class="jx-hud-ico" viewBox="0 0 24 24" aria-hidden="true">
@@ -2057,7 +2704,7 @@ function confirmAddPile() {
                         <path d="M9 18v2h6v-2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
                         <path d="M11 5h2v3h-2z" fill="currentColor" />
                       </svg>
-                      <span class="jx-hud-val">{{ gunHudEnergyLine(pile.pileId, gun.gunId) }}</span>
+                      <span class="jx-hud-val">{{ gunHudEnergyLine(pile, gun.gunId, gun) }}</span>
                     </div>
                     <div class="jx-hud-cell">
                       <svg class="jx-hud-ico" viewBox="0 0 24 24" aria-hidden="true">
@@ -2070,7 +2717,7 @@ function confirmAddPile() {
                           stroke-linejoin="round"
                         />
                       </svg>
-                      <span class="jx-hud-val">{{ gunHudAmountLine(pile.pileId, gun.gunId) }}</span>
+                      <span class="jx-hud-val">{{ gunHudAmountLine(pile, gun.gunId, gun) }}</span>
                     </div>
                   </div>
                 </div>
@@ -2078,12 +2725,52 @@ function confirmAddPile() {
             </div>
           </div>
         </div>
+        </div>
+        </div>
 
         <div v-if="hiddenPileCount > 0" class="jx-hidden-tip">已折叠 {{ hiddenPileCount }} 个桩</div>
+        </div>
+        </div>
 
       </section>
 
-      <aside v-if="drawerVisible" class="jx-panel" :style="{ left: drawerLeftStyle }">
+      <section v-else class="jx-board jx-board--list">
+        <JxBoardList
+          :piles="visiblePiles"
+          :active-pile-id="topologyStore.activePileId"
+          :hidden-pile-count="hiddenPileCount"
+          :login-executing="loginExecuting"
+          :login-executing-pile-id="loginExecutingPileId"
+          :disconnecting="disconnecting"
+          :vin-visible="vinEdit.visible"
+          :vin-pile-id="vinEdit.pileId"
+          :vin-gun-id="vinEdit.gunId"
+          :vin-draft="vinForm.vin"
+          :has-tariff-model="hasTariffModel"
+          :link-state-label="linkStateLabel"
+          :format-rate="formatRate"
+          :period-range-text="periodRangeText"
+          :get-current-tariff-period-index="getCurrentTariffPeriodIndex"
+          :tariff-type-label="tariffTypeLabel"
+          @select-pile="topologyStore.setActivePile"
+          @dblclick-pile="runLoginFlowByPile"
+          @add-pile="openAddDialog"
+          @link-login="onPileLinkIndicatorClick"
+          @link-disconnect="disconnectPileById"
+          @car-click="handleCarClick"
+          @start-control="openStartControlDialog"
+          @vin-close="closeVinEditor"
+          @vin-confirm="confirmLinkCar"
+          @update:vin-draft="(v) => (vinForm.vin = v)"
+        />
+      </section>
+
+      <aside
+        v-if="drawerVisible"
+        class="jx-panel"
+        :class="{ 'jx-panel--list-mode': boardViewMode === 'list' }"
+        :style="boardViewMode === 'topology' ? { left: drawerLeftStyle } : undefined"
+      >
         <div class="jx-panel-tabs">
           <button type="button" class="jx-tab" :class="{ 'is-on': drawerTab === 'basic' }" @click="drawerTab = 'basic'">桩基本信息</button>
           <button type="button" class="jx-tab" :class="{ 'is-on': drawerTab === 'control' }" @click="drawerTab = 'control'">桩控制</button>
@@ -2233,7 +2920,7 @@ function confirmAddPile() {
 
         <div v-show="drawerTab === 'control'" class="jx-panel-body jx-control-only">
           <el-select v-model="selectedFlowId" class="!w-full" placeholder="选择流程" size="small">
-            <el-option v-for="f in protocolStore.activeProtocol.flowTemplates" :key="f.flowId" :label="`${f.name}`" :value="f.flowId" />
+            <el-option v-for="f in selectableFlowTemplates" :key="f.flowId" :label="`${f.name}`" :value="f.flowId" />
           </el-select>
           <div v-if="activeFlow" class="jx-hint-box">
             <div class="jx-hint-title">
@@ -2336,7 +3023,7 @@ function confirmAddPile() {
           <div v-else-if="selectedFlowId === 'scan-qr-vin-start'" class="jx-control-form">
             <p class="jx-flow-hint">
               用户扫码后平台下发 <code>0x59</code>，模拟器回复 <code>0x5B</code> 并创建订单；成功后自动发送带订单号的
-              <code>0x40</code>，鉴权通过后与 VIN 启动一致（<code>0x21</code>→<code>0x22</code>）。<code>0x21</code> 启动结果请在「远端控制启动流程」中配置。
+              <code>0x40</code>，鉴权通过后与 VIN 启动一致（<code>0x21</code>→<code>0x22</code>）。与「扫码远程启动流程」（<code>0x1F</code>）互斥：请在本流程与远程扫码流程中二选一。
             </p>
             <div class="jx-form-row">
               <span class="jx-form-label">0x5B 回复失败</span>
@@ -2360,7 +3047,45 @@ function confirmAddPile() {
             </div>
           </div>
 
-          <div v-else-if="selectedFlowId === 'remote-start'" class="jx-control-form">
+          <div v-else-if="isCardStartFlowSelected" class="jx-control-form">
+            <p class="jx-flow-hint">
+              桩上送 <code>0x19</code> 卡鉴权，平台回复 <code>0x1A</code>；允许充电（标志=1）时以
+              <code>0x1A</code> 订单号创建卡启动订单，随后上送 <code>0x21</code> 并等待 <code>0x22</code>。可在车辆「启动控制」中手动输入卡号触发
+              <code>0x19</code>。
+            </p>
+            <div class="jx-form-row">
+              <span class="jx-form-label">0x21 启动结果</span>
+              <el-select v-model="remoteStartConfig.startResult" size="small" class="jx-form-control">
+                <el-option :value="1" label="成功" />
+                <el-option :value="2" label="失败" />
+              </el-select>
+            </div>
+            <div class="jx-form-row">
+              <span class="jx-form-label">0x21 失败原因</span>
+              <el-select
+                v-model="remoteStartConfig.failReason"
+                size="small"
+                class="jx-form-control"
+                :disabled="remoteStartConfig.startResult === 1"
+              >
+                <el-option :value="0" label="无" />
+                <el-option :value="1" label="设备故障" />
+                <el-option :value="2" label="充电枪使用中" />
+                <el-option :value="3" label="枪未连接车辆" />
+                <el-option :value="4" label="枪口超范围" />
+                <el-option :value="5" label="参数不支持" />
+                <el-option :value="6" label="其它" />
+              </el-select>
+            </div>
+          </div>
+
+          <div v-else-if="isRemoteStartFlowSelected" class="jx-control-form">
+            <p v-if="selectedFlowId === 'scan-qr-remote-start'" class="jx-flow-hint">
+              用户扫描登录下发的枪二维码后，平台下发 <code>0x1F</code>；模拟器自动回复 <code>0x20</code>、上送 <code>0x21</code> 并等待 <code>0x22</code>。下方配置影响 <code>0x21</code> 启动结果。
+            </p>
+            <p v-else class="jx-flow-hint">
+              平台主动下发 <code>0x1F</code> 时走本流程；若由 APP 扫码触发，也可选用「扫码远程启动流程」以便与 <code>0x59</code> VIN 扫码区分。
+            </p>
             <div class="jx-form-row">
               <span class="jx-form-label">启动结果</span>
               <el-select v-model="remoteStartConfig.startResult" size="small" class="jx-form-control">
@@ -2434,6 +3159,8 @@ function confirmAddPile() {
                   <th>启动时间</th>
                   <th>状态</th>
                 <th>推送状态</th>
+                  <th>费率类型</th>
+                  <th>订单费率</th>
                   <th>失败原因</th>
                   <th>操作</th>
                 </tr>
@@ -2446,17 +3173,38 @@ function confirmAddPile() {
                   <td>{{ orderStartTypeLabel(o.startType) }}</td>
                   <td>{{ o.startParam }}</td>
                   <td>{{ new Date(o.startAt).toLocaleString() }}</td>
-                  <td>{{ orderStatusLabel(o.status) }}</td>
+                  <td>{{ orderStatusLabel(o.status, o.failReasonText) }}</td>
                   <td>{{ o.delivery?.status === 'delivered' ? '已送达' : (o.delivery?.pushed ? '未送达' : '未推送') }}</td>
+                  <td>{{ orderTariffTypeLabel(o) }}</td>
+                  <td>
+                    <el-button
+                      v-if="orderTariffViewable(o)"
+                      link
+                      type="primary"
+                      size="small"
+                      @click="openOrderTariffView(o.orderNo)"
+                    >
+                      查看
+                    </el-button>
+                    <span v-else>—</span>
+                  </td>
                   <td>{{ o.failReasonText || '-' }}</td>
                   <td>
                     <el-button link type="primary" size="small" @click="openOrderDetail(o.orderNo)">详情</el-button>
                     <el-button link type="danger" size="small" @click="removeOrder(o.orderNo)">删除</el-button>
-                    <el-button v-if="o.status === 'charging'" link type="warning" size="small" @click="forceStopOrder(o.orderNo)">强制停止</el-button>
+                    <el-button
+                      v-if="showForceOrderAction(o) && topologyStore.activePileId"
+                      link
+                      type="warning"
+                      size="small"
+                      @click="forceStopOrder(o.orderNo)"
+                    >
+                      {{ forceOrderActionLabel(topologyStore.activePileId, o.orderNo) }}
+                    </el-button>
                   </td>
                 </tr>
                 <tr v-if="activePileOrders.length === 0">
-                  <td colspan="10">暂无订单</td>
+                  <td colspan="12">暂无订单</td>
                 </tr>
               </tbody>
             </table>
@@ -2590,13 +3338,16 @@ function confirmAddPile() {
 
       <el-dialog
         v-model="qrDialogVisible"
-        title="启动控制"
+        :title="qrDialogTitle"
         width="420px"
         class="jx-start-control-dialog"
         destroy-on-close
-        @closed="startControlVinEditing = false"
+        @closed="onQrDialogClosed"
       >
         <div v-if="qrDialogPileId && qrDialogGunId" class="jx-start-control-inner">
+          <div class="jx-start-panel-viewport">
+            <Transition :name="qrDialogPanelTransition">
+              <div v-if="qrDialogPanel === 'start'" key="start-panel" class="jx-start-panel-stack">
           <el-tabs v-model="qrDialogTab" class="jx-start-tabs">
             <el-tab-pane label="扫码启动" name="scan">
               <div class="jx-start-pane">
@@ -2610,7 +3361,10 @@ function confirmAddPile() {
                 <div v-else class="jx-start-qr-placeholder">
                   {{ qrDialogLoading ? '正在生成二维码…' : qrDialogText ? '未生成' : '暂无二维码，请确认登录后已下发枪二维码' }}
                 </div>
-                <p class="jx-start-scan-hint">扫码后平台将下发 <code>0x59</code> 触发「扫码VIN启动流程」；请在侧栏流程控制中选择该流程并配置 <code>0x5B</code> 应答。</p>
+                <p class="jx-start-scan-hint">
+                  扫码后平台通常下发 <code>0x1F</code>（账户/卡启动）或 <code>0x59</code>（VIN 启动）。请在侧栏流程控制中选择
+                  <strong>「扫码远程启动流程」</strong>或 <strong>「扫码VIN启动流程」</strong> 之一，并配置对应应答。
+                </p>
               </div>
             </el-tab-pane>
             <el-tab-pane label="VIN启动" name="vin">
@@ -2682,21 +3436,40 @@ function confirmAddPile() {
                 </el-button>
               </div>
             </el-tab-pane>
+            <el-tab-pane label="卡启动" name="card">
+              <div class="jx-start-pane">
+                <div class="jx-start-meta-line">
+                  <span class="jx-start-meta-k">枪号</span>
+                  <span class="jx-start-meta-v">{{ startControlGunLabel }}</span>
+                </div>
+                <div class="jx-start-vin-block">
+                  <span class="jx-start-meta-k">卡号</span>
+                  <el-input
+                    v-model="startControlCardDraft"
+                    size="small"
+                    class="jx-start-vin-input"
+                    maxlength="16"
+                    placeholder="输入刷卡号（最多16位）"
+                    @keyup.enter="onCardAuthStartFromDialog"
+                  />
+                </div>
+                <p class="jx-start-scan-hint">
+                  将上送 <code>0x19</code> 并等待平台 <code>0x1A</code>；允许充电后创建订单并上送
+                  <code>0x21</code>。请在侧栏选择「卡启动流程」并配置 <code>0x21</code> 启动结果。
+                </p>
+                <el-button
+                  type="primary"
+                  class="jx-start-vin-launch-btn"
+                  :loading="cardAuthBusy"
+                  :disabled="cardAuthBusy"
+                  @click="onCardAuthStartFromDialog"
+                >
+                  {{ cardAuthBusy ? '鉴权中…' : '卡启动' }}
+                </el-button>
+              </div>
+            </el-tab-pane>
           </el-tabs>
           <div class="jx-start-disconnect-wrap">
-            <el-tooltip v-if="startControlGunCharging" content="强制停止充电" placement="top">
-              <button type="button" class="jx-start-forcestop-icon" aria-label="强制停止充电" @click="forceStopFromQrDialog">
-                <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none">
-                  <path
-                    d="M7.86 2h8.28L22 7.86v8.28L16.14 22H7.86L2 16.14V7.86L7.86 2zM12 8v4M12 16h.01"
-                    stroke="currentColor"
-                    stroke-width="2"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                  />
-                </svg>
-              </button>
-            </el-tooltip>
             <el-tooltip content="断开车辆链接" placement="top">
               <button type="button" class="jx-start-disconnect-icon" aria-label="断开车辆链接" @click="disconnectFromQrDialog">
                 <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
@@ -2711,6 +3484,63 @@ function confirmAddPile() {
               </button>
             </el-tooltip>
           </div>
+              </div>
+              <div v-else key="charging-panel" class="jx-start-panel-stack jx-charging-info-pane">
+                <div class="jx-start-meta-line">
+                  <span class="jx-start-meta-k">枪号</span>
+                  <span class="jx-start-meta-v">{{ startControlGunLabel }}</span>
+                </div>
+                <div class="jx-charging-info-grid">
+                  <div class="jx-charging-info-row">
+                    <span class="jx-charging-info-k">充电订单号</span>
+                    <span class="jx-charging-info-v jx-charging-info-mono">{{ chargingInfoLive.orderNo }}</span>
+                  </div>
+                  <div class="jx-charging-info-row">
+                    <span class="jx-charging-info-k">启动方式</span>
+                    <span class="jx-charging-info-v">{{ chargingInfoLive.startMethod }}</span>
+                  </div>
+                  <div class="jx-charging-info-row">
+                    <span class="jx-charging-info-k">启动时间</span>
+                    <span class="jx-charging-info-v">{{ chargingInfoLive.startTime }}</span>
+                  </div>
+                  <div class="jx-charging-info-row">
+                    <span class="jx-charging-info-k">车辆 VIN</span>
+                    <span class="jx-charging-info-v jx-charging-info-mono">{{ chargingInfoLive.vin }}</span>
+                  </div>
+                  <div v-if="chargingInfoLive.isCardStart" class="jx-charging-info-row">
+                    <span class="jx-charging-info-k">卡号</span>
+                    <span class="jx-charging-info-v jx-charging-info-mono">{{ chargingInfoLive.cardNo }}</span>
+                  </div>
+                </div>
+                <div class="jx-charging-info-live-grid">
+                  <div class="jx-charging-info-live-cell">
+                    <span class="jx-charging-info-k">充电时长</span>
+                    <span class="jx-charging-info-v jx-charging-info-live">{{ chargingInfoLive.durationText }}</span>
+                  </div>
+                  <div class="jx-charging-info-live-cell">
+                    <span class="jx-charging-info-k">充电电量</span>
+                    <span class="jx-charging-info-v jx-charging-info-live">{{ chargingInfoLive.energyText }}</span>
+                  </div>
+                  <div class="jx-charging-info-live-cell">
+                    <span class="jx-charging-info-k">当前余额</span>
+                    <span class="jx-charging-info-v jx-charging-info-live">{{ chargingInfoLive.balanceText }}</span>
+                  </div>
+                  <div class="jx-charging-info-live-cell">
+                    <span class="jx-charging-info-k">当前功率</span>
+                    <span class="jx-charging-info-v jx-charging-info-live">{{ chargingInfoLive.powerText }}</span>
+                  </div>
+                </div>
+                <el-button
+                  type="danger"
+                  class="jx-charging-stop-btn"
+                  :disabled="!startControlChargingOrder"
+                  @click="forceStopFromQrDialog"
+                >
+                  停止充电
+                </el-button>
+              </div>
+            </Transition>
+          </div>
         </div>
       </el-dialog>
 
@@ -2720,9 +3550,15 @@ function confirmAddPile() {
             <el-descriptions v-if="currentOrderDetail" :column="2" border size="small">
               <el-descriptions-item label="订单号">{{ currentOrderDetail.orderNo }}</el-descriptions-item>
               <el-descriptions-item label="枪号">{{ gunLabel(currentOrderDetail.pileId, currentOrderDetail.gunId) }}</el-descriptions-item>
-              <el-descriptions-item label="状态">{{ orderStatusLabel(currentOrderDetail.status) }}</el-descriptions-item>
+              <el-descriptions-item label="状态">{{ orderStatusLabel(currentOrderDetail.status, currentOrderDetail.failReasonText) }}</el-descriptions-item>
               <el-descriptions-item label="启动类型">{{ orderStartTypeLabel(currentOrderDetail.startType) }}</el-descriptions-item>
               <el-descriptions-item label="用户ID">{{ currentOrderDetail.latest23?.userId || currentOrderDetail.request23?.userId || '-' }}</el-descriptions-item>
+              <el-descriptions-item
+                v-if="currentOrderDetail.startAuthSource === '0x19-card'"
+                label="卡号"
+              >
+                {{ currentOrderDetail.request23?.userId || '-' }}
+              </el-descriptions-item>
               <el-descriptions-item label="用户类型">{{ currentOrderDetail.latest23?.userType ?? currentOrderDetail.request23?.userType ?? '-' }}</el-descriptions-item>
               <el-descriptions-item label="组织机构">{{ currentOrderDetail.latest23?.orgCode || currentOrderDetail.request23?.orgCode || '-' }}</el-descriptions-item>
               <el-descriptions-item label="VIN">{{ currentOrderDetail.latest23?.vin || '-' }}</el-descriptions-item>
@@ -2779,72 +3615,282 @@ function confirmAddPile() {
         </el-tabs>
       </el-dialog>
 
+      <el-dialog v-model="orderTariffDialogVisible" title="订单费率" width="480px" destroy-on-close>
+        <template v-if="orderTariffViewSnapshot">
+          <div class="jx-rate-panel-head" style="margin-bottom: 8px; display: flex; flex-wrap: wrap; gap: 12px;">
+            <span>费率类型：{{ orderTariffViewOrder ? orderTariffTypeLabel(orderTariffViewOrder) : '-' }}</span>
+            <span>计费模型版本：{{ orderTariffViewSnapshot.version }}</span>
+            <span>停车费率：{{ formatRate(orderTariffViewSnapshot.parkingRate) }}</span>
+          </div>
+          <table v-if="orderTariffViewSnapshot.periods.length > 0" class="jx-gun-table">
+            <thead>
+              <tr>
+                <th>时段</th>
+                <th>类型</th>
+                <th>电价</th>
+                <th>服务费</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="(tp, idx) in orderTariffViewSnapshot.periods" :key="`order-tp-${idx}`">
+                <td>{{ periodRangeText(orderTariffViewSnapshot.periods, idx) }}</td>
+                <td>{{ tariffTypeLabel(tp.type) }}</td>
+                <td>{{ formatRate(tp.electricRate) }}</td>
+                <td>{{ formatRate(tp.serviceRate) }}</td>
+              </tr>
+            </tbody>
+          </table>
+          <div v-else class="jx-rate-empty">暂无时段数据</div>
+          <p v-if="orderTariffViewOrder && !orderTariffViewOrder.tariffSnapshot" class="jx-rate-empty" style="margin-top: 8px;">
+            费率副本将在枪启动成功（0x22）后生效
+          </p>
+        </template>
+        <div v-else class="jx-rate-empty">暂无订单费率数据</div>
+      </el-dialog>
+
     </div>
+
+    <Teleport to="body">
+      <div
+        v-if="boardViewMode === 'topology' && vinEdit.visible"
+        class="jx-vin-pop jx-vin-pop--fixed"
+        :style="vinPopStyle"
+      >
+        <button type="button" class="jx-vin-close" aria-label="关闭" @click="closeVinEditor">×</button>
+        <el-input
+          v-model="vinForm.vin"
+          size="small"
+          placeholder="输入VIN"
+          maxlength="20"
+          @keyup.enter="confirmLinkCar"
+        />
+        <button
+          type="button"
+          class="jx-vin-icon-btn"
+          aria-label="连接车辆"
+          @click="confirmLinkCar"
+        >
+          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+            <path d="M8 3v6M12 3v6M6 9h8v3a4 4 0 0 1-4 4H9v4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+        </button>
+      </div>
+    </Teleport>
   </div>
 </template>
 
+<style src="./jx-plugin-theme.css"></style>
+
 <style scoped>
 .jx-scope {
-  --jx-teal: color-mix(in oklab, #34d3df 72%, var(--um-brand, #20b8a6) 28%);
-  --jx-board-bg: color-mix(in oklab, var(--um-bg, #0b1722) 88%, #0a1a28 12%);
-  --jx-panel-bg: color-mix(in oklab, var(--um-surface, #102332) 84%, #0a1a28 16%);
-  --jx-border: color-mix(in oklab, var(--um-border, #6ea5c8) 42%, var(--jx-board-bg) 58%);
-  --jx-text: color-mix(in oklab, var(--um-text, #d8e7f2) 96%, #e2eef7 4%);
-  --jx-muted: color-mix(in oklab, var(--um-text-muted, #8ba6bc) 92%, #97b3c9 8%);
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
   font-family: system-ui, 'Segoe UI', sans-serif;
   color: var(--jx-text);
 }
 
-.jx-page { position: relative; display: flex; min-height: calc(100vh - 11rem); flex-direction: column; gap: 12px; }
-.jx-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; border-radius: 8px; border: 1px solid var(--jx-border); background: color-mix(in oklab, #0f2434 85%, black 15%); padding: 10px 12px; }
+.jx-page { position: relative; display: flex; flex: 1; min-height: 0; flex-direction: column; gap: 12px; overflow: hidden; }
+.jx-toolbar { flex-shrink: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; border-radius: 8px; border: 1px solid var(--jx-border); background: var(--jx-chrome-bg); padding: 10px 12px; }
 .jx-toolbar-field { display: flex; align-items: center; gap: 8px; }
 .jx-toolbar-grow { flex: 1; min-width: 220px; }
 .jx-ico { width: 32px; text-align: center; color: var(--jx-teal); font-size: 12px; }
 .jx-select { width: 200px; }
 .jx-search { flex: 1; }
 .jx-toolbar-actions { margin-left: auto; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.jx-board-view-bar {
+  flex-shrink: 0;
+  display: flex;
+  justify-content: flex-start;
+  align-items: center;
+  padding: 0 2px;
+}
+.jx-view-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 3px;
+  border-radius: 999px;
+  border: 1px solid var(--jx-accent-border);
+  background: var(--jx-toggle-track);
+}
+
+.jx-view-toggle-btn {
+  border: none;
+  border-radius: 999px;
+  padding: 6px 16px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.2;
+  color: var(--jx-muted);
+  background: transparent;
+  cursor: pointer;
+  transition: background 0.2s ease, color 0.2s ease, box-shadow 0.2s ease, transform 0.15s ease;
+}
+
+.jx-view-toggle-btn:hover:not(.is-on) {
+  color: var(--jx-text);
+  background: var(--jx-accent-soft);
+}
+
+.jx-view-toggle-btn.is-on {
+  color: var(--jx-toggle-active-fg);
+  background: linear-gradient(180deg, color-mix(in oklab, var(--jx-brand) 92%, white 8%), color-mix(in oklab, var(--jx-brand) 72%, var(--um-brand-muted) 28%));
+  box-shadow: 0 2px 8px color-mix(in oklab, var(--jx-brand) 28%, transparent);
+}
+
+.jx-view-toggle-btn:active {
+  transform: scale(0.97);
+}
+
+.jx-protocol-menu-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border-radius: 999px;
+  padding: 6px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.2;
+  color: var(--jx-muted);
+  background: var(--jx-toggle-track);
+  border: 1px solid var(--jx-accent-border);
+  cursor: pointer;
+  transition: background 0.2s ease, color 0.2s ease, box-shadow 0.2s ease, transform 0.15s ease;
+}
+
+.jx-protocol-menu-btn:hover:not(:disabled) {
+  color: var(--jx-text);
+  background: var(--jx-accent-soft);
+}
+
+.jx-protocol-menu-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.jx-protocol-menu-caret {
+  opacity: 0.75;
+}
+
 .jx-mini-select { width: 112px; }
 
-.jx-board { position: relative; flex: 1; overflow: hidden; border-radius: 10px; border: 1px solid var(--jx-border); background: radial-gradient(circle at 50% -20%, color-mix(in oklab, var(--jx-teal) 20%, transparent), transparent 60%), var(--jx-board-bg); padding: 20px 16px 80px; min-height: 460px; }
+.jx-board {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  border-radius: 10px;
+  border: 1px solid var(--jx-border);
+  background: radial-gradient(circle at 50% -20%, color-mix(in oklab, var(--jx-teal) 20%, transparent), transparent 60%), var(--jx-board-bg);
+  padding: 20px 16px 16px;
+}
+.jx-board-topology-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  width: 100%;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.jx-board-topology-scroll::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+}
+.jx-board-topology-inner { width: 100%; padding-bottom: 72px; box-sizing: border-box; }
+.jx-topology-stack { width: 100%; }
+.jx-topology-row-block {
+  position: relative;
+  margin-top: 4px;
+  box-sizing: border-box;
+}
+.jx-topology-row-block + .jx-topology-row-block {
+  margin-top: 28px;
+}
+.jx-topology-row-block.is-scroll {
+  max-width: 100%;
+}
+.jx-board--list { padding: 12px; display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+.jx-board--list :deep(.jx-board-list) { flex: 1; min-height: 0; height: 100%; }
 .jx-hub-wrap { display: flex; justify-content: center; }
 .jx-hub { display: flex; flex-direction: column; align-items: center; gap: 8px; padding-top: 8px; }
-.jx-hub-cap { border-radius: 999px; background: color-mix(in oklab, #0f2434 90%, black 10%); border: 1px solid var(--jx-border); padding: 4px 14px; font-size: 12px; color: var(--jx-muted); }
+.jx-hub-cap { border-radius: 999px; background: var(--jx-surface); border: 1px solid var(--jx-border); padding: 4px 14px; font-size: 12px; color: var(--jx-muted); }
 .jx-main-link { width: 2px; height: 28px; margin: 6px auto 0; border-radius: 999px; background: var(--jx-teal); }
 
-.jx-topology { display: grid; gap: clamp(8px, 2vw, 18px); margin: 0 auto; width: min(1020px, 98%); }
-.jx-topology { position: relative; }
-.jx-bus-line { grid-column: 1 / -1; height: 2px; border-radius: 999px; background: linear-gradient(to right, transparent 0, var(--jx-teal) 4%, var(--jx-teal) 96%, transparent 100%); }
+.jx-topology { position: relative; width: 100%; box-sizing: border-box; }
+.jx-bus-line { width: 100%; height: 2px; margin-bottom: 6px; border-radius: 999px; background: linear-gradient(to right, transparent 0, var(--jx-teal) 4%, var(--jx-teal) 96%, transparent 100%); }
+.jx-pile-row {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: flex-start;
+  gap: var(--jx-row-gap, 5px);
+  width: 100%;
+  box-sizing: border-box;
+}
+.jx-topology-row-block.is-scroll .jx-pile-row {
+  width: max-content;
+}
 .jx-add-plus {
-  position: absolute;
-  right: 0;
-  top: -12px;
-  width: 20px;
-  height: 20px;
+  width: 28px;
+  height: 28px;
   border: none;
   background: transparent;
   color: #22c55e;
-  font-size: 26px;
+  font-size: 28px;
   font-weight: 800;
   line-height: 1;
   cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 0.15s ease, filter 0.15s ease;
 }
-.jx-pile-col { display: flex; flex-direction: column; align-items: center; position: relative; }
-.jx-drop-up { width: 2px; height: 22px; margin-bottom: 6px; background: var(--jx-teal); }
-.jx-pile-left-info { position: absolute; right: calc(50% + 34px); top: 40px; display: flex; flex-direction: column; align-items: flex-end; gap: 3px; }
-.jx-pile-id { font-size: 11px; font-weight: 700; }
-.jx-rate-icon {
-  border: none;
-  width: 18px;
-  height: 18px;
+
+.jx-add-plus--float {
+  position: absolute;
+  right: 10px;
+  top: 10px;
+  z-index: 1;
   border-radius: 999px;
-  font-size: 11px;
-  line-height: 1;
-  font-weight: 700;
-  color: #9ca3af;
-  background: color-mix(in oklab, #0f2434 90%, black 10%);
-  cursor: pointer;
+  background: color-mix(in oklab, var(--jx-surface) 82%, transparent);
+  backdrop-filter: blur(4px);
 }
-.jx-rate-icon.is-set { color: #fbbf24; }
+
+.jx-add-plus--float:hover {
+  transform: scale(1.08);
+  filter: brightness(1.1);
+}
+
+.jx-add-plus.is-disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+.jx-pile-col { display: flex; flex-direction: column; align-items: center; position: relative; flex-shrink: 0; }
+.jx-drop-up { width: 2px; height: 22px; margin-bottom: 6px; background: var(--jx-teal); }
+.jx-pile-id-top {
+  font-size: 11px;
+  font-weight: 700;
+  text-align: center;
+  line-height: 1.3;
+  word-break: break-all;
+  max-width: min(140px, 100%);
+  margin-bottom: 4px;
+}
+.jx-pile-left-info {
+  position: absolute;
+  right: calc(50% + 34px);
+  top: 6px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 3px;
+}
 .jx-link-indicator {
   width: 20px;
   height: 20px;
@@ -2924,9 +3970,32 @@ function confirmAddPile() {
   cursor: not-allowed;
 }
 
-.jx-car-strip { display: grid; gap: clamp(8px, 2vw, 18px); margin: 6px auto 0; width: min(1020px, 98%); }
-.jx-car-slot { display: flex; flex-direction: column; align-items: center; gap: 4px; }
-.jx-gun-cluster { --jx-gun-node-width: 100px; --jx-gun-gap: 12px; display: inline-flex; flex-direction: column; align-items: center; width: fit-content; }
+.jx-car-strip {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: var(--jx-row-gap, 5px);
+  margin: 6px 0 0;
+  width: 100%;
+  box-sizing: border-box;
+}
+.jx-topology-row-block.is-scroll .jx-car-strip {
+  width: max-content;
+}
+.jx-car-slot { display: flex; flex-direction: column; align-items: center; gap: 4px; flex-shrink: 0; }
+.jx-gun-cluster {
+  --jx-gun-node-width: 100px;
+  --jx-gun-gap: 0;
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  width: fit-content;
+}
+/* 多枪时列宽贴合内容，去掉列内留白，组间间距最小 */
+.jx-gun-cluster.is-gun-count-2,
+.jx-gun-cluster.is-gun-count-3,
+.jx-gun-cluster.is-gun-count-4 {
+  --jx-gun-node-width: 82px;
+}
 .jx-car-bus-wrap { width: 100%; min-width: 0; display: flex; flex-direction: column; align-items: center; }
 .jx-car-bus-drop { width: 2px; height: 16px; background: var(--jx-teal); }
 .jx-car-bus-line {
@@ -2997,22 +4066,23 @@ function confirmAddPile() {
 .jx-car-pct.is-live {
   color: #22c55e;
 }
-/* 车辆下实时数据：每行两项（2 列网格），多行展示 */
+/* 车辆下实时数据：单列、与车图左缘对齐 */
 .jx-car-hud {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  column-gap: 6px;
-  row-gap: 4px;
-  width: 100%;
-  max-width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  align-self: center;
+  width: 74px;
   margin-top: 4px;
-  line-height: 1.15;
-  justify-items: stretch;
+  gap: 3px;
+  line-height: 1.2;
 }
 .jx-hud-cell {
   display: flex;
   align-items: center;
-  gap: 3px;
+  justify-content: flex-start;
+  gap: 4px;
+  width: 100%;
   min-width: 0;
   color: color-mix(in oklab, var(--jx-muted) 90%, #64748b 10%);
 }
@@ -3020,28 +4090,24 @@ function confirmAddPile() {
   color: #22c55e;
 }
 .jx-hud-ico {
-  width: 10px;
-  height: 10px;
+  width: 11px;
+  height: 11px;
   flex-shrink: 0;
   color: currentColor;
 }
 .jx-hud-val {
   min-width: 0;
-  font-size: 9px;
+  font-size: 10px;
   font-weight: 600;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 .jx-hud-val--soc {
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 700;
 }
 .jx-vin-pop {
-  position: absolute;
-  top: 56px;
-  left: 50%;
-  transform: translateX(-50%);
   display: flex;
   align-items: center;
   gap: 6px;
@@ -3051,7 +4117,12 @@ function confirmAddPile() {
   border: 1px solid var(--jx-border);
   background: color-mix(in oklab, #132e44 90%, black 10%);
   box-shadow: 0 8px 14px color-mix(in oklab, black 25%, transparent);
-  z-index: 4;
+}
+
+.jx-vin-pop--fixed {
+  position: fixed;
+  z-index: 4000;
+  transform: translateX(-50%);
 }
 .jx-vin-close {
   position: absolute;
@@ -3078,7 +4149,8 @@ function confirmAddPile() {
 }
 .jx-hidden-tip { text-align: center; margin-top: 6px; font-size: 11px; color: var(--jx-muted); }
 
-.jx-panel { position: absolute; left: 20px; bottom: 16px; z-index: 2; display: flex; width: min(560px, 94vw); height: min(72vh, 560px); flex-direction: column; overflow: hidden; border-radius: 10px; border: 1px solid var(--jx-border); background: var(--jx-panel-bg); }
+.jx-panel { position: absolute; left: 20px; bottom: 16px; z-index: 30; display: flex; width: min(560px, 94vw); height: min(72vh, 560px); flex-direction: column; overflow: hidden; border-radius: 10px; border: 1px solid var(--jx-border); background: var(--jx-panel-bg); }
+.jx-panel--list-mode { left: auto; right: 12px; }
 .jx-panel-tabs { position: relative; display: flex; align-items: center; border-bottom: 1px solid var(--jx-border); background: color-mix(in oklab, #133147 88%, black 12%); }
 .jx-tab { flex: 1; border: none; background: transparent; padding: 10px 12px; font-size: 13px; font-weight: 600; color: var(--jx-muted); cursor: pointer; }
 .jx-tab.is-on { color: var(--jx-teal); box-shadow: inset 0 -2px 0 var(--jx-teal); }
@@ -3135,11 +4207,6 @@ function confirmAddPile() {
   font-weight: 700;
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25);
 }
-.jx-rate-panel { font-size: 12px; color: #dbe7f3; }
-.jx-rate-panel-head { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 8px; color: #9fb7cc; }
-.jx-rate-table { width: 100%; border-collapse: collapse; font-size: 11px; }
-.jx-rate-table th,
-.jx-rate-table td { border: 1px solid #36556f; padding: 4px 6px; text-align: left; }
 .jx-rate-empty { color: #9fb7cc; font-size: 11px; }
 
 .jx-log-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
@@ -3205,6 +4272,100 @@ function confirmAddPile() {
   flex-direction: column;
   gap: 0;
   min-height: 0;
+}
+.jx-start-panel-viewport {
+  position: relative;
+  overflow: hidden;
+  min-height: 300px;
+}
+.jx-start-panel-stack {
+  width: 100%;
+}
+.jx-panel-slide-forward-enter-active,
+.jx-panel-slide-forward-leave-active {
+  transition: transform 0.32s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.28s ease;
+}
+.jx-panel-slide-forward-leave-active {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  z-index: 1;
+}
+.jx-panel-slide-forward-leave-to {
+  transform: translateX(-100%);
+  opacity: 0.35;
+}
+.jx-panel-slide-forward-enter-from {
+  transform: translateX(100%);
+  opacity: 0.35;
+}
+.jx-panel-slide-forward-enter-to,
+.jx-panel-slide-forward-leave-from {
+  transform: translateX(0);
+  opacity: 1;
+}
+.jx-panel-slide-instant-enter-active,
+.jx-panel-slide-instant-leave-active {
+  transition: none;
+}
+.jx-charging-info-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 300px;
+  padding-top: 4px;
+}
+.jx-charging-info-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.jx-charging-info-live-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px 14px;
+  flex: 1;
+  align-content: start;
+  margin-top: 4px;
+  padding-top: 12px;
+  border-top: 1px solid var(--jx-border);
+}
+.jx-charging-info-live-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.jx-charging-info-row {
+  display: grid;
+  grid-template-columns: 6.5em 1fr;
+  gap: 8px;
+  align-items: start;
+  font-size: 13px;
+  line-height: 1.45;
+}
+.jx-charging-info-k {
+  color: var(--jx-muted);
+  font-weight: 600;
+}
+.jx-charging-info-v {
+  color: var(--jx-text);
+  font-weight: 500;
+  word-break: break-all;
+}
+.jx-charging-info-mono {
+  font-family: ui-monospace, 'Cascadia Mono', monospace;
+  font-size: 12px;
+  letter-spacing: 0.02em;
+}
+.jx-charging-info-live {
+  color: var(--jx-teal);
+  font-weight: 700;
+}
+.jx-charging-stop-btn {
+  width: 100%;
+  margin-top: auto;
 }
 .jx-start-tabs :deep(.el-tabs__content) {
   padding-top: 10px;
@@ -3349,15 +4510,38 @@ function confirmAddPile() {
 }
 
 :deep(.el-input__wrapper),
-:deep(.el-select__wrapper) { border-radius: 6px; background-color: color-mix(in oklab, #15354c 82%, black 18%); }
+:deep(.el-select__wrapper) {
+  border-radius: 6px;
+  background-color: var(--jx-input-bg);
+  box-shadow: 0 0 0 1px var(--jx-border) inset;
+}
+
+:deep(.el-input__wrapper:hover),
+:deep(.el-select__wrapper:hover) {
+  box-shadow: 0 0 0 1px var(--jx-accent-border) inset;
+}
+
+:deep(.el-input__wrapper.is-focus),
+:deep(.el-select__wrapper.is-focused) {
+  box-shadow: 0 0 0 1px var(--jx-brand) inset;
+}
+
 :deep(.el-input__inner),
 :deep(.el-select__placeholder),
 :deep(.el-select__selected-item),
 :deep(.el-radio-button__inner),
 :deep(.el-descriptions__label),
-:deep(.el-descriptions__content) { color: var(--jx-text); }
-:deep(.jx-rate-popover) {
-  border: 1px solid var(--jx-border);
-  background: color-mix(in oklab, #122a3d 88%, black 12%);
+:deep(.el-descriptions__content) {
+  color: var(--jx-text);
+}
+
+:deep(.el-input__inner::placeholder) {
+  color: var(--jx-muted);
+}
+
+:deep(.el-input__clear),
+:deep(.el-select__caret),
+:deep(.el-select__icon) {
+  color: var(--jx-muted);
 }
 </style>

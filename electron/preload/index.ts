@@ -19,7 +19,10 @@ type CecInvokeAction =
   | 'queryStationStatus'
   | 'clientStartCharge'
   | 'clientStopCharge'
+  | 'clientQueryTerminalCode'
   | 'syncOrderStatus'
+  | 'clearInboundToken'
+  | 'clearThirdPartyToken'
 
 const unions = {
   getSettings: (): Promise<{ themeMode: ThemeMode }> => ipcRenderer.invoke('settings:get'),

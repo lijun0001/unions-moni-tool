@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { useLicenseStore } from '@renderer/stores/license'
+import WorkspaceFrame from '@renderer/components/WorkspaceFrame.vue'
 
 const T = {
   title: '\u6ce8\u518c\u6fc0\u6d3b',
@@ -65,10 +66,7 @@ async function submit() {
 </script>
 
 <template>
-  <div
-    class="px-[var(--space-xl)] pb-[var(--space-2xl)] pt-[calc(var(--space-2xl)+3rem)]"
-    data-license-exempt
-  >
+  <WorkspaceFrame data-license-exempt>
     <h1 class="um-display text-2xl font-semibold text-[var(--um-text)]">{{ T.title }}</h1>
     <p class="mt-2 max-w-[75ch] text-sm text-[var(--um-text-muted)]">
       {{ T.pkgPrefix }}<strong class="text-[var(--um-text)]">{{ editionLabel }}</strong>{{ T.pkgDot }}
@@ -143,5 +141,5 @@ async function submit() {
     >
       {{ T.backHome }}
     </button>
-  </div>
+  </WorkspaceFrame>
 </template>

@@ -3,6 +3,7 @@ import {
   decryptDataBase64,
   encryptDataJson,
   signEnvelope,
+  validateCecAesSecretPair,
   verifyEnvelopeSig,
 } from './cec-crypto'
 
@@ -30,5 +31,10 @@ describe('cec-crypto', () => {
   it('throws when AES key/iv are not exactly 16 utf8 bytes', () => {
     expect(() => encryptDataJson('{"a":1}', 'short', 'abcdefghijklmnop')).toThrow(/16 bytes/)
     expect(() => encryptDataJson('{"a":1}', '1234567890123456', 'short')).toThrow(/16 bytes/)
+  })
+
+  it('validateCecAesSecretPair returns message instead of throwing', () => {
+    expect(validateCecAesSecretPair('1234567890123456', 'abcdefghijklmnop')).toBeNull()
+    expect(validateCecAesSecretPair('short', 'abcdefghijklmnop')).toMatch(/16 bytes/)
   })
 })

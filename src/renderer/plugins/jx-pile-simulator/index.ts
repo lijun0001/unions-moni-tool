@@ -1,6 +1,7 @@
 import { markRaw } from 'vue'
 import type { ProtocolSimulatorPlugin } from '@shared/plugin-contract'
 import JxMainView from './JxMainView.vue'
+import introMarkdown from './docs/user-manual.md?raw'
 
 export const meta = {
   id: 'jx-pile-simulator',
@@ -17,10 +18,13 @@ export const homeCard = {
 
 export const MainView = markRaw(JxMainView)
 
+export { introMarkdown }
+
 const plugin: ProtocolSimulatorPlugin = {
   meta,
   homeCard,
   MainView,
+  introMarkdown,
 }
 
 export default plugin

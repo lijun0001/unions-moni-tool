@@ -97,6 +97,18 @@ body {
 .el-message-box {
   z-index: 6200 !important;
 }
+/* Select/Dropdown 下拉层需高于 dialog(6101)，否则弹窗内无法点选 */
+.el-select__popper.el-popper,
+.el-popper.el-select__popper,
+.cec-dialog-select-popper {
+  z-index: 6150 !important;
+}
+.el-message {
+  z-index: 6300 !important;
+}
+.el-notification {
+  z-index: 6300 !important;
+}
 .el-dialog__headerbtn,
 .el-message-box__headerbtn {
   pointer-events: auto !important;

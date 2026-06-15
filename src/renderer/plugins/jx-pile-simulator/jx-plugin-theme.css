@@ -1,0 +1,23 @@
+/* 玖行桩插件语义色：跟随宿主 --um-* 主题变量 */
+.jx-scope {
+  --jx-brand: var(--um-brand);
+  --jx-teal: var(--um-brand);
+  --jx-bg: var(--um-bg);
+  --jx-board-bg: var(--um-bg);
+  --jx-panel-bg: var(--um-surface);
+  --jx-surface: var(--um-surface);
+  --jx-surface-2: var(--um-surface-2);
+  --jx-border: var(--um-border);
+  --jx-text: var(--um-text);
+  --jx-muted: var(--um-text-muted);
+  --jx-accent-soft: color-mix(in oklab, var(--um-brand) 12%, transparent);
+  --jx-accent-border: color-mix(in oklab, var(--um-brand) 32%, var(--um-border));
+  --jx-accent-line: color-mix(in oklab, var(--um-brand) 50%, var(--um-border));
+  --jx-chrome-bg: var(--um-surface);
+  --jx-input-bg: var(--um-surface-2);
+  --jx-toggle-track: var(--um-surface-2);
+  --jx-toggle-active-fg: oklch(0.98 0.01 250);
+  --jx-shadow: color-mix(in oklab, var(--um-text) 10%, transparent);
+  --jx-link: var(--um-brand);
+  --jx-pile-id: color-mix(in oklab, var(--um-brand) 78%, #3b82f6 22%);
+}

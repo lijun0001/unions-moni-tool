@@ -2,7 +2,11 @@ import { describe, expect, it } from 'vitest'
 import {
   buildVinStart5bPayload,
   decodeCmdPayload,
+  getActiveListenFlow,
+  isRemoteStartListenFlow,
+  isScanQrVinListenFlow,
   parseVinStart59Payload,
+  setActiveListenFlow,
 } from './protocol-executor'
 
 describe('parseVinStart59Payload / buildVinStart5bPayload', () => {
@@ -33,5 +37,27 @@ describe('parseVinStart59Payload / buildVinStart5bPayload', () => {
   it('returns null when 0x59 order no is empty', () => {
     const hex = '1905190a0b0c00' + '0'.repeat(64)
     expect(parseVinStart59Payload(hex)).toBeNull()
+  })
+})
+
+describe('active listen flow routing', () => {
+  it('only scan-qr-vin-start enables 0x59 handler', () => {
+    expect(isScanQrVinListenFlow('scan-qr-vin-start')).toBe(true)
+    expect(isScanQrVinListenFlow('scan-qr-remote-start')).toBe(false)
+    expect(isScanQrVinListenFlow('remote-start')).toBe(false)
+    expect(isScanQrVinListenFlow(null)).toBe(false)
+  })
+
+  it('remote start flows include scan-qr-remote-start and remote-start', () => {
+    expect(isRemoteStartListenFlow('scan-qr-remote-start')).toBe(true)
+    expect(isRemoteStartListenFlow('remote-start')).toBe(true)
+    expect(isRemoteStartListenFlow('scan-qr-vin-start')).toBe(false)
+  })
+
+  it('setActiveListenFlow tracks per pile', () => {
+    setActiveListenFlow('P1', 'scan-qr-vin-start')
+    expect(getActiveListenFlow('P1')).toBe('scan-qr-vin-start')
+    setActiveListenFlow('P1', '')
+    expect(getActiveListenFlow('P1')).toBeNull()
   })
 })

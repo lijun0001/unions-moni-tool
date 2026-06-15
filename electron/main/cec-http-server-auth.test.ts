@@ -94,7 +94,7 @@ describe('dispatchCecRequest token reject response', () => {
       '/api/link-uuid-1/query_stations_info',
     )
 
-    expect(out.status).toBe(403)
+    expect(out.status).toBe(200)
     expect(out.body.Msg).toBe('token有误，请重新获取')
     expect(String(out.body.Sig ?? '')).toMatch(/^[0-9A-F]{32}$/)
   })

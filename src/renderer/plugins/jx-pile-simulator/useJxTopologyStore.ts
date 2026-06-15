@@ -83,8 +83,15 @@ function normalizePile(input: JxTopologyPile, fallbackProtocolId: string, idx: n
 
 export const useJxTopologyStore = defineStore('jx-topology', () => {
   const piles = ref<JxTopologyPile[]>([])
-  const activePileId = ref<string | null>(piles.value[0]?.pileId ?? null)
+  const activePileId = ref<string | null>(null)
   const keyword = ref('')
+
+  function syncActivePileSelection() {
+    if (!activePileId.value) return
+    if (!piles.value.some((x) => x.pileId === activePileId.value)) {
+      activePileId.value = null
+    }
+  }
 
   function persist() {
     try {
@@ -99,7 +106,7 @@ export const useJxTopologyStore = defineStore('jx-topology', () => {
       const raw = localStorage.getItem(STORAGE_KEY)
       if (!raw) {
         piles.value = [buildDefaultPile(defaultProtocolId, 1)]
-        activePileId.value = piles.value[0]?.pileId ?? null
+        activePileId.value = null
         persist()
         return
       }
@@ -109,10 +116,10 @@ export const useJxTopologyStore = defineStore('jx-topology', () => {
       } else {
         piles.value = parsed.map((x, idx) => normalizePile(x, defaultProtocolId, idx))
       }
-      activePileId.value = piles.value[0]?.pileId ?? null
+      syncActivePileSelection()
     } catch {
       piles.value = [buildDefaultPile(defaultProtocolId, 1)]
-      activePileId.value = piles.value[0]?.pileId ?? null
+      activePileId.value = null
       persist()
     }
   }
@@ -167,7 +174,7 @@ export const useJxTopologyStore = defineStore('jx-topology', () => {
     if (!piles.value.length) {
       activePileId.value = null
     } else if (activePileId.value === pileId) {
-      activePileId.value = piles.value[Math.max(0, idx - 1)]?.pileId ?? piles.value[0]?.pileId ?? null
+      activePileId.value = null
     }
     persist()
   }
@@ -224,14 +231,26 @@ export const useJxTopologyStore = defineStore('jx-topology', () => {
   ) {
     const pile = piles.value.find((x) => x.pileId === pileId)
     if (!pile) return
+    const wasPileCharging = pile.status === 'charging'
     if (patch.status) pile.status = patch.status
     if (patch.onlineState) pile.onlineState = patch.onlineState
     if (typeof patch.allowTimeoutCount === 'number') pile.allowTimeoutCount = patch.allowTimeoutCount
     if (typeof patch.heartbeatIntervalSec === 'number') pile.heartbeatIntervalSec = patch.heartbeatIntervalSec
     if (patch.tariffModel !== undefined) pile.tariffModel = patch.tariffModel
+    if (patch.status && wasPileCharging && patch.status !== 'charging') {
+      for (const g of pile.guns) {
+        g.soc = undefined
+      }
+    }
     if (patch.gunPatch?.gunId) {
       const gun = pile.guns.find((g) => g.gunId === patch.gunPatch?.gunId)
-      if (gun) Object.assign(gun, patch.gunPatch)
+      if (gun) {
+        const wasGunCharging = gun.status === 'charging'
+        Object.assign(gun, patch.gunPatch)
+        if (wasGunCharging && gun.status !== 'charging' && patch.gunPatch.soc === undefined) {
+          gun.soc = undefined
+        }
+      }
     }
     persist()
   }

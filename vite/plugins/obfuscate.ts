@@ -70,6 +70,11 @@ export function createObfuscatePlugin(target: ObfuscateTarget, enabled: boolean)
     renderChunk(code, chunk) {
       if (!chunk.fileName.endsWith('.js') && !chunk.fileName.endsWith('.mjs')) return null
       if (!code.trim()) return null
+      /** 第三方依赖不做混淆，避免破坏 html5-qrcode / zxing 等解码逻辑 */
+      const moduleIds = chunk.moduleIds ?? []
+      const isVendorChunk = moduleIds.some((id) => id.replace(/\\/g, '/').includes('node_modules'))
+      const isVendorFile = /html5-qrcode|jsqr|zxing|exceljs|echarts|qrcode/i.test(chunk.fileName)
+      if (isVendorChunk || isVendorFile) return null
       try {
         const result = obfuscateChunkQuiet(code, optionsFor(target))
         return {

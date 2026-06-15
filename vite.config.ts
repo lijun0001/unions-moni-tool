@@ -87,6 +87,9 @@ export default defineConfig(({ command }) => {
       sourcemap,
       minify: isBuild,
     },
+    optimizeDeps: {
+      include: ['html5-qrcode', 'jsqr'],
+    },
     server: {
       port: 5173,
     },

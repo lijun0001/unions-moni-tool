@@ -24,6 +24,8 @@ import {
   type CecOrderRecord,
   type CecProtocolMapping,
   type CecStationRecord,
+  type CecInboundAuthTokenEntry,
+  type CecThirdPartyTokenEntry,
   type CecThirdPartySecrets,
 } from '@shared/cec-types'
 import { policySevicePrice, resolveCurrentPolicyPeriod } from '@shared/cec-policy-utils'
@@ -189,6 +191,35 @@ function compareStationCellStr(a: string, b: string): number {
   return a.localeCompare(b, 'zh-CN', { numeric: true, sensitivity: 'base' })
 }
 
+/** 互联互通配置列表：筛选与分页（与站点列表一致） */
+const linkKeyword = ref('')
+const linkPage = ref(1)
+const linkPageSize = ref(10)
+
+const filteredLinks = computed(() => {
+  const kw = linkKeyword.value.trim().toLowerCase()
+  const list = snapshot.value.links
+  if (!kw) return list
+  return list.filter((l) => {
+    const hay = [l.name, l.linkUuid].join(' ').toLowerCase()
+    return hay.includes(kw)
+  })
+})
+
+const pagedLinks = computed(() => {
+  const start = (linkPage.value - 1) * linkPageSize.value
+  return filteredLinks.value.slice(start, start + linkPageSize.value)
+})
+
+watch(linkKeyword, () => {
+  linkPage.value = 1
+})
+
+watch([filteredLinks, linkPageSize], () => {
+  const maxPage = Math.max(1, Math.ceil(filteredLinks.value.length / linkPageSize.value) || 1)
+  if (linkPage.value > maxPage) linkPage.value = maxPage
+})
+
 /** 订单查看：筛选与分页 */
 const orderSeqFilter = ref('')
 const orderPage = ref(1)
@@ -201,12 +232,108 @@ const linkDialog = ref(false)
 const editingLink = ref<CecLinkConfig | null>(null)
 const linkImportInputRef = ref<HTMLInputElement | null>(null)
 
+const tokenDialogOpen = ref(false)
+const tokenDialogLink = ref<CecLinkConfig | null>(null)
+
+const tokenDialogInbound = computed((): CecInboundAuthTokenEntry | null => {
+  const uuid = tokenDialogLink.value?.linkUuid
+  if (!uuid) return null
+  return snapshot.value.inboundAuthTokenByLink?.[uuid] ?? null
+})
+
+const tokenDialogThirdParty = computed((): CecThirdPartyTokenEntry | null => {
+  const uuid = tokenDialogLink.value?.linkUuid
+  if (!uuid) return null
+  return snapshot.value.thirdPartyTokenByLink?.[uuid] ?? null
+})
+
+type TokenPresence = 'none' | 'valid' | 'expired'
+
+function tokenEntryPresence(
+  entry: CecInboundAuthTokenEntry | CecThirdPartyTokenEntry | null | undefined,
+): TokenPresence {
+  if (!entry?.accessToken) return 'none'
+  return entry.expiresAtMs > Date.now() ? 'valid' : 'expired'
+}
+
+function tokenPresenceLabel(presence: TokenPresence): string {
+  if (presence === 'valid') return '有效'
+  if (presence === 'expired') return '已过期'
+  return '未生成'
+}
+
+function formatTokenExpiresAt(ms: number): string {
+  return new Date(ms).toLocaleString()
+}
+
+function openTokenDialog(row: CecLinkConfig) {
+  tokenDialogLink.value = row
+  tokenDialogOpen.value = true
+  void pullMainMerge()
+}
+
+async function clearInboundTokenInDialog() {
+  const link = tokenDialogLink.value
+  if (!link) return
+  const entry = tokenDialogInbound.value
+  if (!entry?.accessToken) {
+    ElMessage.info('暂无内部 token')
+    return
+  }
+  try {
+    await ElMessageBox.confirm('确认使内部 token 立即失效并清除？', '清除内部 Token', {
+      type: 'warning',
+      confirmButtonText: '清除',
+      cancelButtonText: '取消',
+    })
+  } catch {
+    return
+  }
+  try {
+    const r = await invokeCec<{ ok: boolean; error?: string }>('clearInboundToken', { linkUuid: link.linkUuid })
+    if (!r.ok) throw new Error(r.error || '清除失败')
+    await pullMainMerge()
+    ElMessage.success('内部 token 已清除')
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : String(e))
+  }
+}
+
+async function clearThirdPartyTokenInDialog() {
+  const link = tokenDialogLink.value
+  if (!link) return
+  const entry = tokenDialogThirdParty.value
+  if (!entry?.accessToken) {
+    ElMessage.info('暂无三方 token')
+    return
+  }
+  try {
+    await ElMessageBox.confirm('确认使三方 token 立即失效并清除？', '清除三方 Token', {
+      type: 'warning',
+      confirmButtonText: '清除',
+      cancelButtonText: '取消',
+    })
+  } catch {
+    return
+  }
+  try {
+    const r = await invokeCec<{ ok: boolean; error?: string }>('clearThirdPartyToken', { linkUuid: link.linkUuid })
+    if (!r.ok) throw new Error(r.error || '清除失败')
+    await pullMainMerge()
+    ElMessage.success('三方 token 已清除')
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : String(e))
+  }
+}
+
 /** 手机模拟：启动充电全屏页与确认弹窗 */
 const phoneStartMode = ref<'scan' | 'device'>('scan')
 const startMoneyScanStr = ref('')
 const startMoneyDeviceStr = ref('')
 const startDeviceIdInput = ref('')
 const pendingQrText = ref('')
+const scanConnectorId = ref('')
+const qrResolving = ref(false)
 const startConfirmDialogOpen = ref(false)
 const fileInputStartRef = ref<HTMLInputElement | null>(null)
 /** 进入「启动充电」页面前的 Tab（充电 / 订单），用于返回 */
@@ -1425,6 +1552,8 @@ const stationPolicyConnectorRows = computed(() => {
   return flattenStationConnectors(ctx.station)
 })
 
+const stationDetailLinkUuid = computed(() => stationDetailCtx.value?.linkUuid ?? '')
+
 const stationPolicyFilteredRows = computed(() => {
   const q = policyFilter.value.trim().toLowerCase()
   const rows = stationPolicyConnectorRows.value
@@ -1499,6 +1628,9 @@ async function syncPolicyForConnector(connectorId: string) {
     } else {
       ElMessage.error(r.error)
     }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    ElMessage.error(msg || '同步费率失败')
   } finally {
     policySyncingConnector.value = null
   }
@@ -1529,6 +1661,9 @@ async function syncPolicyAllFiltered() {
       }
     }
     ElMessage.success('已全部同步')
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    ElMessage.error(msg || '同步费率失败')
   } finally {
     policySyncAllLoading.value = false
   }
@@ -1547,6 +1682,52 @@ function parseOptionalMoney(s: string): number | undefined {
   return Number.isFinite(n) ? n : undefined
 }
 
+function findStationIdForConnector(connectorId: string): { linkUuid: string; stationId: string } | null {
+  const cid = connectorId.trim()
+  if (!cid) return null
+  const map = snapshot.value.connectorMap[cid]
+  if (!map) return null
+  const stations = snapshot.value.stationsByLink[map.linkUuid] ?? []
+  for (const st of stations) {
+    const eqs = (st as { EquipmentInfos?: { ConnectorInfos?: { ConnectorID: string }[] }[] }).EquipmentInfos
+    if (!Array.isArray(eqs)) continue
+    for (const eq of eqs) {
+      for (const c of eq?.ConnectorInfos ?? []) {
+        if (String(c?.ConnectorID ?? '').trim() === cid) {
+          return { linkUuid: map.linkUuid, stationId: String(st.StationID ?? '').trim() }
+        }
+      }
+    }
+  }
+  return { linkUuid: map.linkUuid, stationId: '' }
+}
+
+function isConnectorStationOpen(connectorId: string): boolean {
+  const ctx = findStationIdForConnector(connectorId)
+  if (!ctx?.stationId) return false
+  const openSet = new Set((snapshot.value.openStationIds[ctx.linkUuid] ?? []).map(String))
+  return openSet.has(ctx.stationId)
+}
+
+function validateConnectorForStart(
+  connectorId: string,
+  mode: 'scan' | 'device' = 'scan',
+): string | null {
+  const cid = connectorId.trim()
+  if (!cid) {
+    return mode === 'scan'
+      ? '请先完成二维码解析，设备号（ConnectorID）不能为空'
+      : '请输入设备号'
+  }
+  if (!snapshot.value.connectorMap[cid]) {
+    return '本地未找到该设备号，请先在站点查看中拉取场站信息'
+  }
+  if (!isConnectorStationOpen(cid)) {
+    return '该设备所属场站未开放，请在站点查看中开放后再启动'
+  }
+  return null
+}
+
 /** 与扫码一致：用设备号查 connectorMap，再发起 query_start_charge（qr 与扫码内容对应）；money 为模拟侧可选扩展字段 */
 async function startChargeWithConnector(
   connectorIdRaw: string,
@@ -1554,15 +1735,12 @@ async function startChargeWithConnector(
   money?: number,
 ): Promise<boolean> {
   const connectorId = connectorIdRaw.trim()
-  if (!connectorId) {
-    ElMessage.warning('请输入设备号')
+  const gate = validateConnectorForStart(connectorId)
+  if (gate) {
+    ElMessage.warning(gate)
     return false
   }
-  const map = snapshot.value.connectorMap[connectorId]
-  if (!map) {
-    ElMessage.error('未找到该枪归属，请先拉取站点')
-    return false
-  }
+  const map = snapshot.value.connectorMap[connectorId]!
   const r = await invokeCec<
     { ok: true; text: string; startChargeSeq: string } | { ok: false; error: string }
   >('clientStartCharge', {
@@ -1585,6 +1763,35 @@ async function startChargeWithConnector(
   return false
 }
 
+async function resolveConnectorFromQrText(qrText: string): Promise<boolean> {
+  const qr = qrText.trim()
+  if (!qr) return false
+  if (!snapshot.value.links.length) {
+    ElMessage.warning('请先配置互联互通对接')
+    return false
+  }
+  qrResolving.value = true
+  scanConnectorId.value = ''
+  try {
+    let lastErr = '二维码解析失败'
+    for (const link of snapshot.value.links) {
+      const r = await invokeCec<
+        { ok: true; connectorId: string; linkUuid: string } | { ok: false; error: string }
+      >('clientQueryTerminalCode', { linkUuid: link.linkUuid, qrCode: qr })
+      if (r.ok) {
+        scanConnectorId.value = r.connectorId
+        ElMessage.success(`已解析设备号：${r.connectorId}`)
+        return true
+      }
+      lastErr = r.error
+    }
+    ElMessage.error(lastErr)
+    return false
+  } finally {
+    qrResolving.value = false
+  }
+}
+
 async function pickQrImageForStart(e: Event) {
   const f = (e.target as HTMLInputElement).files?.[0]
   if (!f) return
@@ -1596,7 +1803,10 @@ async function pickQrImageForStart(e: Event) {
     const r = await h.scanFile(f, true)
     pendingQrText.value = r
     phoneStartMode.value = 'scan'
-    ElMessage.success('已识别二维码')
+    scanConnectorId.value = ''
+    await resolveConnectorFromQrText(r)
+  } catch {
+    ElMessage.error('未能从图片中识别二维码')
   } finally {
     await h.clear()
   }
@@ -1609,9 +1819,24 @@ function openStartChargeConfirm() {
       ElMessage.warning('请先选择二维码图片并完成识别')
       return
     }
+    if (qrResolving.value) {
+      ElMessage.warning('正在解析二维码，请稍候')
+      return
+    }
+    const gate = validateConnectorForStart(scanConnectorId.value, 'scan')
+    if (gate) {
+      ElMessage.warning(gate)
+      return
+    }
   } else if (!startDeviceIdInput.value?.trim()) {
     ElMessage.warning('请输入设备号')
     return
+  } else {
+    const gate = validateConnectorForStart(startDeviceIdInput.value, 'device')
+    if (gate) {
+      ElMessage.warning(gate)
+      return
+    }
   }
   startConfirmDialogOpen.value = true
 }
@@ -1624,7 +1849,7 @@ const startConfirmMoneyLabel = computed(() => {
 })
 
 const startConfirmConnectorPreview = computed(() => {
-  if (phoneStartMode.value === 'scan') return pendingQrText.value?.trim() || '—'
+  if (phoneStartMode.value === 'scan') return scanConnectorId.value?.trim() || '—'
   return startDeviceIdInput.value?.trim() || '—'
 })
 
@@ -1636,7 +1861,7 @@ async function confirmStartChargeFromDialog() {
   let ok = false
   if (phoneStartMode.value === 'scan') {
     const text = pendingQrText.value.trim()
-    ok = await startChargeWithConnector(text, text, money)
+    ok = await startChargeWithConnector(scanConnectorId.value, text, money)
   } else {
     const raw = startDeviceIdInput.value
     ok = await startChargeWithConnector(raw, raw.trim(), money)
@@ -1644,6 +1869,7 @@ async function confirmStartChargeFromDialog() {
   if (!ok) return
   startConfirmDialogOpen.value = false
   pendingQrText.value = ''
+  scanConnectorId.value = ''
   startDeviceIdInput.value = ''
   startMoneyScanStr.value = ''
   startMoneyDeviceStr.value = ''
@@ -2238,9 +2464,9 @@ function bindHttpGuideAnchorListeners(bind: boolean) {
 </script>
 
 <template>
-  <div class="cec-plugin-root relative flex flex-col gap-[var(--space-lg)] text-[var(--um-text)]">
+  <div class="cec-plugin-root relative flex min-h-0 flex-1 flex-col gap-[var(--space-lg)] text-[var(--um-text)]">
     <div id="cec-file-qr-hidden" class="fixed left-0 top-0 h-px w-px overflow-hidden opacity-0" aria-hidden="true" />
-    <header class="relative z-[6200] flex flex-wrap items-center gap-3">
+    <header class="flex shrink-0 flex-wrap items-center gap-3">
       <h2 class="um-display text-lg font-semibold text-[var(--um-text)]">内互联模拟</h2>
       <div class="relative inline-flex shrink-0">
         <el-tooltip :content="httpRunning ? '停止 HTTP 服务' : '启动 HTTP 服务'" placement="bottom">
@@ -2448,8 +2674,15 @@ function bindHttpGuideAnchorListeners(bind: boolean) {
                         <el-input v-model="startMoneyScanStr" size="small" placeholder="可选" clearable />
                       </div>
                       <div>
-                        <el-button size="small" type="primary" plain @click="fileInputStartRef?.click()">
-                          选择二维码图片
+                        <el-button
+                          size="small"
+                          type="primary"
+                          plain
+                          :loading="qrResolving"
+                          :disabled="qrResolving"
+                          @click="fileInputStartRef?.click()"
+                        >
+                          {{ qrResolving ? '解析中…' : '选择二维码图片' }}
                         </el-button>
                         <input
                           ref="fileInputStartRef"
@@ -2459,14 +2692,28 @@ function bindHttpGuideAnchorListeners(bind: boolean) {
                           @change="pickQrImageForStart"
                         />
                       </div>
+                      <div>
+                        <div class="mb-1 text-xs text-[var(--um-text-muted)]">设备号（ConnectorID）</div>
+                        <el-input
+                          :model-value="scanConnectorId"
+                          size="small"
+                          placeholder="选择二维码后将自动解析"
+                          readonly
+                        />
+                      </div>
                       <p
                         v-if="pendingQrText"
-                        class="max-h-28 overflow-auto break-all text-xs text-[var(--um-text-muted)]"
+                        class="max-h-20 overflow-auto break-all text-xs text-[var(--um-text-muted)]"
                       >
-                        已识别：{{ pendingQrText }}
+                        二维码原文：{{ pendingQrText }}
                       </p>
                       <div class="border-t border-[var(--um-border)] pt-4">
-                        <button type="button" class="cec-btn-primary w-full" @click="openStartChargeConfirm">
+                        <button
+                          type="button"
+                          class="cec-btn-primary w-full"
+                          :disabled="qrResolving"
+                          @click="openStartChargeConfirm"
+                        >
                           启动
                         </button>
                       </div>
@@ -2916,8 +3163,8 @@ function bindHttpGuideAnchorListeners(bind: boolean) {
           v-if="rightPanel !== 'none'"
           class="cec-side-panel rounded-[var(--um-radius)] border border-[var(--um-border)] bg-[var(--um-surface)] p-[var(--space-md)]"
         >
-          <div v-if="rightPanel === 'links'">
-            <div class="mb-2 flex flex-wrap gap-2">
+          <div v-if="rightPanel === 'links'" class="cec-side-panel-inner cec-biz-panel">
+            <div class="mb-3 flex flex-wrap gap-2">
               <el-button type="primary" size="small" @click="openLinkDialog()">新增配置</el-button>
               <el-button size="small" @click="triggerLinkImport">导入 JSON</el-button>
               <input
@@ -2928,24 +3175,48 @@ function bindHttpGuideAnchorListeners(bind: boolean) {
                 @change="onImportLinkConfig"
               />
             </div>
-            <el-table :data="snapshot.links" size="small">
-              <el-table-column prop="name" label="名称" />
-              <el-table-column prop="linkUuid" label="对接码" width="140" />
-              <el-table-column label="操作" width="200">
+            <div class="mb-3 flex flex-wrap items-end gap-4">
+              <div>
+                <div class="mb-1 text-xs text-[var(--um-text-muted)]">关键字</div>
+                <el-input
+                  v-model="linkKeyword"
+                  size="small"
+                  clearable
+                  placeholder="名称 / 对接码"
+                  style="width: 220px"
+                />
+              </div>
+            </div>
+            <el-table :data="pagedLinks" size="small" max-height="420" border>
+              <el-table-column prop="name" label="名称" min-width="100" show-overflow-tooltip />
+              <el-table-column prop="linkUuid" label="对接码" min-width="120" show-overflow-tooltip />
+              <el-table-column label="操作" width="248" align="center">
                 <template #default="{ row }">
                   <el-button link type="primary" size="small" @click="openLinkDialog(row)">编辑</el-button>
+                  <el-button link type="primary" size="small" @click="openTokenDialog(row)">Token</el-button>
                   <el-button link type="primary" size="small" @click="exportLinkConfigJson(row)">导出 JSON</el-button>
                   <el-button link type="danger" size="small" @click="removeLink(row.id)">删除</el-button>
                 </template>
               </el-table-column>
             </el-table>
+            <div class="mt-3 flex justify-end">
+              <el-pagination
+                v-model:current-page="linkPage"
+                v-model:page-size="linkPageSize"
+                :page-sizes="[10, 20, 50, 100]"
+                layout="total, sizes, prev, pager, next"
+                :total="filteredLinks.length"
+                size="small"
+                background
+              />
+            </div>
           </div>
-          <div v-else>
-            <div class="mb-2 flex items-center gap-2">
+          <div v-else class="cec-side-panel-inner">
+            <div class="cec-side-panel-toolbar mb-2 flex items-center gap-2">
               <el-input v-model="logFilter" size="small" placeholder="过滤关键字" clearable />
               <el-button size="small" type="danger" plain @click="clearAllLogs">清空日志</el-button>
             </div>
-            <div class="cec-scroll-unified max-h-[420px] space-y-1 overflow-auto text-xs">
+            <div class="cec-side-panel-scroll cec-scroll-unified space-y-1 text-xs">
               <div
                 v-for="log in filteredLogs"
                 :key="log.id"
@@ -3045,7 +3316,7 @@ function bindHttpGuideAnchorListeners(bind: boolean) {
       </section>
     </div>
 
-    <el-dialog v-model="pullDialogOpen" title="拉取站点" width="440px" destroy-on-close>
+    <el-dialog v-model="pullDialogOpen" title="拉取站点" width="440px" destroy-on-close append-to-body>
       <p class="mb-3 text-xs leading-relaxed text-[var(--um-text-muted)]">
         按分页连续调用 query_stations_info，直至无更多页，站点合并写入所选第三方对接并更新枪号映射。
       </p>
@@ -3056,6 +3327,8 @@ function bindHttpGuideAnchorListeners(bind: boolean) {
             placeholder="选择互联互通对接"
             class="w-full"
             filterable
+            teleported
+            popper-class="cec-dialog-select-popper"
           >
             <el-option
               v-for="l in snapshot.links"
@@ -3335,7 +3608,7 @@ function bindHttpGuideAnchorListeners(bind: boolean) {
                     <div class="mb-1 text-[11px] text-[var(--um-text-muted)]">时段费率（PolicyInfos）</div>
                     <el-table
                       :data="
-                        snapshot.equipBusinessPolicyByKey?.[policyKey(stationDetailCtx.linkUuid, pr.connectorId)]
+                        snapshot.equipBusinessPolicyByKey?.[policyKey(stationDetailLinkUuid, pr.connectorId)]
                           ?.PolicyInfos ?? []
                       "
                       size="small"
@@ -3346,7 +3619,9 @@ function bindHttpGuideAnchorListeners(bind: boolean) {
                         <template #default="{ row: pi }">{{ pi.StartTime }}</template>
                       </el-table-column>
                       <el-table-column label="电费" width="120" align="right">
-                        <template #default="{ row: pi }">{{ Number(pi.ElecPrice).toFixed(4) }}</template>
+                        <template #default="{ row: pi }">{{
+                          Number.isFinite(Number(pi.ElecPrice)) ? Number(pi.ElecPrice).toFixed(4) : '—'
+                        }}</template>
                       </el-table-column>
                       <el-table-column label="服务费" width="120" align="right">
                         <template #default="{ row: pi }">{{ policySevicePrice(pi).toFixed(4) }}</template>
@@ -3363,17 +3638,17 @@ function bindHttpGuideAnchorListeners(bind: boolean) {
               </el-table-column>
               <el-table-column label="时段数" width="80" align="center">
                 <template #default="{ row: pr }">
-                  {{ policySumPeriod(stationDetailCtx.linkUuid, pr.connectorId) }}
+                  {{ policySumPeriod(stationDetailLinkUuid, pr.connectorId) }}
                 </template>
               </el-table-column>
               <el-table-column label="同步时间" min-width="150" show-overflow-tooltip>
                 <template #default="{ row: pr }">
-                  {{ formatPolicyFetched(stationDetailCtx.linkUuid, pr.connectorId) }}
+                  {{ formatPolicyFetched(stationDetailLinkUuid, pr.connectorId) }}
                 </template>
               </el-table-column>
               <el-table-column label="状态" min-width="140" show-overflow-tooltip>
                 <template #default="{ row: pr }">
-                  {{ policyRowStatus(stationDetailCtx.linkUuid, pr.connectorId) }}
+                  {{ policyRowStatus(stationDetailLinkUuid, pr.connectorId) }}
                 </template>
               </el-table-column>
               <el-table-column label="操作" width="100" align="center" fixed="right">
@@ -3507,7 +3782,7 @@ function bindHttpGuideAnchorListeners(bind: boolean) {
           <el-input v-model="editingLink.linkUuid" readonly />
         </el-form-item>
         <el-form-item label="协议">
-          <el-select v-model="editingLink.protocolId">
+          <el-select v-model="editingLink.protocolId" teleported popper-class="cec-dialog-select-popper">
             <el-option v-for="p in snapshot.protocols" :key="p.protocolId" :label="p.protocolName" :value="p.protocolId" />
           </el-select>
         </el-form-item>
@@ -3563,13 +3838,88 @@ function bindHttpGuideAnchorListeners(bind: boolean) {
       </template>
     </el-dialog>
 
+    <el-dialog
+      v-model="tokenDialogOpen"
+      :title="tokenDialogLink ? `Token · ${tokenDialogLink.name}` : 'Token'"
+      width="560px"
+      destroy-on-close
+    >
+      <div v-if="tokenDialogLink" class="space-y-4">
+        <button
+          type="button"
+          class="cec-token-card w-full rounded border border-[var(--um-border)] bg-[var(--um-surface-2)] p-3 text-left transition-colors hover:border-[var(--el-color-primary-light-5)]"
+          @click="clearInboundTokenInDialog()"
+        >
+          <div class="mb-2 flex items-center justify-between gap-2">
+            <span class="text-sm font-medium text-[var(--um-text)]">内部 Token</span>
+            <span
+              class="text-xs"
+              :class="
+                tokenEntryPresence(tokenDialogInbound) === 'valid'
+                  ? 'text-[oklch(0.65_0.12_140)]'
+                  : tokenEntryPresence(tokenDialogInbound) === 'expired'
+                    ? 'text-amber-500'
+                    : 'text-[var(--um-text-muted)]'
+              "
+            >
+              {{ tokenPresenceLabel(tokenEntryPresence(tokenDialogInbound)) }}
+            </span>
+          </div>
+          <p class="mb-1 text-xs text-[var(--um-text-muted)]">本机 HTTP 签发给对端调用时的 Bearer token（query_token 应答）</p>
+          <p class="break-all font-mono text-xs text-[var(--um-text)]">
+            {{ tokenDialogInbound?.accessToken || '—' }}
+          </p>
+          <p v-if="tokenDialogInbound?.accessToken" class="mt-2 text-xs text-[var(--um-text-muted)]">
+            过期时间：{{ formatTokenExpiresAt(tokenDialogInbound.expiresAtMs) }}
+          </p>
+          <p class="mt-2 text-[10px] text-[var(--um-text-muted)]">点击此区域可清除并使 token 失效</p>
+        </button>
+
+        <button
+          type="button"
+          class="cec-token-card w-full rounded border border-[var(--um-border)] bg-[var(--um-surface-2)] p-3 text-left transition-colors hover:border-[var(--el-color-primary-light-5)]"
+          @click="clearThirdPartyTokenInDialog()"
+        >
+          <div class="mb-2 flex items-center justify-between gap-2">
+            <span class="text-sm font-medium text-[var(--um-text)]">三方 Token</span>
+            <span
+              class="text-xs"
+              :class="
+                tokenEntryPresence(tokenDialogThirdParty) === 'valid'
+                  ? 'text-[oklch(0.65_0.12_140)]'
+                  : tokenEntryPresence(tokenDialogThirdParty) === 'expired'
+                    ? 'text-amber-500'
+                    : 'text-[var(--um-text-muted)]'
+              "
+            >
+              {{ tokenPresenceLabel(tokenEntryPresence(tokenDialogThirdParty)) }}
+            </span>
+          </div>
+          <p class="mb-1 text-xs text-[var(--um-text-muted)]">向外请求对端时缓存的 query_token AccessToken</p>
+          <p class="break-all font-mono text-xs text-[var(--um-text)]">
+            {{ tokenDialogThirdParty?.accessToken || '—' }}
+          </p>
+          <p v-if="tokenDialogThirdParty?.accessToken" class="mt-2 text-xs text-[var(--um-text-muted)]">
+            过期时间：{{ formatTokenExpiresAt(tokenDialogThirdParty.expiresAtMs) }}
+          </p>
+          <p class="mt-2 text-[10px] text-[var(--um-text-muted)]">点击此区域可清除并使 token 失效</p>
+        </button>
+      </div>
+      <template #footer>
+        <el-button @click="tokenDialogOpen = false">关闭</el-button>
+      </template>
+    </el-dialog>
+
     <el-dialog v-model="startConfirmDialogOpen" title="确认启动充电" width="420px" destroy-on-close>
       <el-descriptions :column="1" size="small" border>
         <el-descriptions-item label="方式">
           {{ phoneStartMode === 'scan' ? '扫码充电' : '设备号充电' }}
         </el-descriptions-item>
-        <el-descriptions-item label="设备 / 二维码内容">
+        <el-descriptions-item label="设备号（ConnectorID）">
           <span class="break-all">{{ startConfirmConnectorPreview }}</span>
+        </el-descriptions-item>
+        <el-descriptions-item v-if="phoneStartMode === 'scan'" label="二维码原文">
+          <span class="break-all">{{ pendingQrText?.trim() || '—' }}</span>
         </el-descriptions-item>
         <el-descriptions-item label="金额（元）">{{ startConfirmMoneyLabel }}</el-descriptions-item>
       </el-descriptions>
@@ -4000,11 +4350,26 @@ function bindHttpGuideAnchorListeners(bind: boolean) {
   min-height: 200px;
 }
 
+/* 侧栏配置/日志：内容少时随内容增高，超出窗口可用高度时在列表区滚动 */
+.cec-plugin-root {
+  --cec-side-panel-max-height: calc(
+    100dvh - var(--um-shell-content-top) - var(--um-shell-canvas-inset) - var(--um-workspace-inner-gap) -
+      var(--space-lg) - 2.75rem
+  );
+  --cec-side-panel-scroll-max-height: calc(var(--cec-side-panel-max-height) - 5.5rem);
+}
+
 .cec-workspace {
   display: grid;
-  min-height: min(70vh, 720px);
+  flex: 1;
+  min-height: 0;
   gap: var(--space-lg);
   grid-template-columns: minmax(320px, 390px) minmax(560px, 1fr) auto;
+  align-items: start;
+}
+
+.cec-workspace > * {
+  min-height: 0;
 }
 
 .cec-pane {
@@ -4041,7 +4406,8 @@ function bindHttpGuideAnchorListeners(bind: boolean) {
   display: flex;
   gap: 10px;
   align-items: flex-start;
-  justify-content: flex-end;
+  min-height: 0;
+  max-height: var(--cec-side-panel-max-height);
 }
 
 .cec-side-rail {
@@ -4050,6 +4416,8 @@ function bindHttpGuideAnchorListeners(bind: boolean) {
   padding: 8px 6px;
   flex-direction: column;
   gap: 8px;
+  flex-shrink: 0;
+  align-self: flex-start;
 }
 
 .cec-side-btn {
@@ -4076,12 +4444,30 @@ function bindHttpGuideAnchorListeners(bind: boolean) {
 }
 
 .cec-side-panel {
+  display: flex;
+  flex-direction: column;
   width: min(420px, 28vw);
   min-width: 320px;
-  height: min(70vh, 720px);
-  overflow: auto;
+  height: auto;
+  max-height: var(--cec-side-panel-max-height);
+  overflow: hidden;
   transform-origin: right center;
   animation: cec-side-open 160ms ease-out;
+}
+
+.cec-side-panel-inner {
+  display: flex;
+  flex-direction: column;
+}
+
+.cec-side-panel-toolbar {
+  flex-shrink: 0;
+}
+
+.cec-side-panel-scroll {
+  min-height: 0;
+  max-height: var(--cec-side-panel-scroll-max-height);
+  overflow: auto;
 }
 
 .cec-process-content {
@@ -4153,8 +4539,7 @@ function bindHttpGuideAnchorListeners(bind: boolean) {
   .cec-side-panel {
     width: 100%;
     min-width: 0;
-    height: auto;
-    max-height: none;
+    max-height: var(--cec-side-panel-max-height);
     margin-top: 8px;
   }
 }
@@ -4416,7 +4801,7 @@ function bindHttpGuideAnchorListeners(bind: boolean) {
 
 /* 内互联插件统一滚动条：与表格滚动条风格保持一致 */
 .cec-scroll-unified,
-.cec-side-panel,
+.cec-side-panel-scroll,
 .cec-phone-scroll,
 .cec-phone-panel-list-scroll,
 .cec-station-desc {
@@ -4425,7 +4810,7 @@ function bindHttpGuideAnchorListeners(bind: boolean) {
 }
 
 .cec-scroll-unified::-webkit-scrollbar,
-.cec-side-panel::-webkit-scrollbar,
+.cec-side-panel-scroll::-webkit-scrollbar,
 .cec-phone-scroll::-webkit-scrollbar,
 .cec-phone-panel-list-scroll::-webkit-scrollbar,
 .cec-station-desc::-webkit-scrollbar {
@@ -4434,7 +4819,7 @@ function bindHttpGuideAnchorListeners(bind: boolean) {
 }
 
 .cec-scroll-unified::-webkit-scrollbar-track,
-.cec-side-panel::-webkit-scrollbar-track,
+.cec-side-panel-scroll::-webkit-scrollbar-track,
 .cec-phone-scroll::-webkit-scrollbar-track,
 .cec-phone-panel-list-scroll::-webkit-scrollbar-track,
 .cec-station-desc::-webkit-scrollbar-track {
@@ -4442,7 +4827,7 @@ function bindHttpGuideAnchorListeners(bind: boolean) {
 }
 
 .cec-scroll-unified::-webkit-scrollbar-thumb,
-.cec-side-panel::-webkit-scrollbar-thumb,
+.cec-side-panel-scroll::-webkit-scrollbar-thumb,
 .cec-phone-scroll::-webkit-scrollbar-thumb,
 .cec-phone-panel-list-scroll::-webkit-scrollbar-thumb,
 .cec-station-desc::-webkit-scrollbar-thumb {
@@ -4453,7 +4838,7 @@ function bindHttpGuideAnchorListeners(bind: boolean) {
 }
 
 .cec-scroll-unified::-webkit-scrollbar-thumb:hover,
-.cec-side-panel::-webkit-scrollbar-thumb:hover,
+.cec-side-panel-scroll::-webkit-scrollbar-thumb:hover,
 .cec-phone-scroll::-webkit-scrollbar-thumb:hover,
 .cec-phone-panel-list-scroll::-webkit-scrollbar-thumb:hover,
 .cec-station-desc::-webkit-scrollbar-thumb:hover {

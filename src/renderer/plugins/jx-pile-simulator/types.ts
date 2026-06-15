@@ -149,6 +149,20 @@ export interface JxRuntimeLog {
 
 export type JxOrderStatus = 'created' | 'start-accepted' | 'starting' | 'charging' | 'failed' | 'stopped'
 
+/** 订单分段电量表（充电过程中逐段累积，已结束段不丢） */
+export type JxOrderPeriodEnergySegment = {
+  modelIndex: number
+  startMs: number
+  endMs: number
+  startTime: string
+  endTime: string
+  electricRate: number
+  serviceRate: number
+  energyKwh: number
+  electricFeeYuan: number
+  serviceFeeYuan: number
+}
+
 /** 订单绑定的计费模型副本（与桩当前 `tariffModel` 结构一致，另带来源标记） */
 export type JxOrderTariffSnapshot = {
   version: number
@@ -162,7 +176,7 @@ export type JxOrderTariffSnapshot = {
     serviceRate: number
   }>
   /** `pile-0x37` / `0x1f-embedded` / `0x41-vin-local` / `0x41-vin-embedded` 等来源说明见订单详情节律费率展示 */
-  source: 'pile-0x37' | '0x1f-embedded' | '0x41-vin-local' | '0x41-vin-embedded'
+  source: 'pile-0x37' | '0x1f-embedded' | '0x41-vin-local' | '0x41-vin-embedded' | '0x1a-local' | '0x1a-embedded'
   updatedAt: number
 }
 
@@ -201,6 +215,23 @@ export interface JxPileOrder {
     accountBalanceFen?: number
     /** 启动时桩内计费模型版本（与 `0x37` 下发一致），用于订单推送 */
     tariffModelVersionAtStart?: number
+    /**
+     * 启动报文 billing=2 时附带的内嵌费率；`0x22` 充电成功后再写入 `tariffSnapshot`。
+     * 桩展示/存储仍只用 `pile.tariffModel`（0x37）。
+     */
+    pendingEmbeddedTariff?: {
+      version: number
+      parkingRate: number
+      periods: Array<{
+        index: number
+        startHour: number
+        startMinute: number
+        type: number
+        electricRate: number
+        serviceRate: number
+      }>
+      updatedAt: number
+    }
     /** V2.24 `0x23`：充电卡余额（元），报文分辨率 0.01 元 */
     chargingCardBalanceYuan?: number
   }
@@ -254,6 +285,8 @@ export interface JxPileOrder {
     bcsCurrent: number
     soc: number
   }>
+  /** 分段电量表：跨费率时段逐段累积，已结束段保留；充电中仅末段更新结束时间与电量 */
+  periodEnergySegments?: JxOrderPeriodEnergySegment[]
   latest25?: {
     chargeEnergyKwh: number
     chargeAmountYuan: number

@@ -18,6 +18,7 @@ import {
   decryptDataBase64,
   encryptDataJson,
   signEnvelope,
+  validateCecAesSecretPair,
   verifyEnvelopeSig,
 } from '../../src/shared/cec-crypto'
 import { getCecSnapshot, patchCecSnapshot, setCecSnapshot } from './cec-state'
@@ -85,46 +86,38 @@ function trimOp(s: string): string {
   return String(s ?? '').trim()
 }
 
+function extractQueryTokenRequestFields(
+  dataObj: Record<string, unknown>,
+  envelopeOperatorId: string,
+): { reqOid: string; reqSec: string } {
+  const reqOid = String(
+    dataObj.OperatorID ?? dataObj.operatorID ?? dataObj.operatorId ?? envelopeOperatorId ?? '',
+  ).trim()
+  const reqSec = String(dataObj.OperatorSecret ?? dataObj.operatorSecret ?? '')
+  return { reqOid, reqSec }
+}
+
 /**
- * 入站验签与解密所用秘钥候选（附件 §4.2：双方交换；请求方 OperatorID 与本地/三方平台编码一致时用对应 DataSecret/SigSecret）。
+ * 入站 query_token 凭证：仅校验三方 OperatorID + 本地 OperatorSecret。
  */
-function inboundSecretCandidates(link: CecLinkConfig, operatorId: string): InboundCryptoSecrets[] {
-  const oid = trimOp(operatorId)
+export function matchInboundQueryTokenCredentials(
+  link: CecLinkConfig,
+  reqOid: string,
+  reqSec: string,
+): boolean {
+  const oid = trimOp(reqOid)
+  if (!oid || !String(reqSec ?? '')) return false
+  return oid === trimOp(link.thirdParty.operatorId) && reqSec === link.local.operatorSecret
+}
+
+/** 入站验签与解密固定使用互联互通本地配置（服务平台侧秘钥） */
+function inboundLocalSecrets(link: CecLinkConfig): InboundCryptoSecrets {
   const loc = link.local
-  const tp = link.thirdParty
-  const locId = trimOp(loc.operatorId)
-  const tpId = trimOp(tp.operatorId)
-  const out: InboundCryptoSecrets[] = []
-  const push = (s: InboundCryptoSecrets) => {
-    if (!out.some((x) => x.sigSecret === s.sigSecret && x.dataSecret === s.dataSecret)) out.push(s)
+  return {
+    dataSecret: loc.dataSecret,
+    dataSecretIV: loc.dataSecretIV,
+    sigSecret: loc.sigSecret,
   }
-  if (oid && locId && oid === locId) {
-    push({
-      dataSecret: loc.dataSecret,
-      dataSecretIV: loc.dataSecretIV,
-      sigSecret: loc.sigSecret,
-    })
-  }
-  if (oid && tpId && oid === tpId) {
-    push({
-      dataSecret: tp.dataSecret,
-      dataSecretIV: tp.dataSecretIV,
-      sigSecret: tp.sigSecret,
-    })
-  }
-  if (out.length === 0) {
-    push({
-      dataSecret: loc.dataSecret,
-      dataSecretIV: loc.dataSecretIV,
-      sigSecret: loc.sigSecret,
-    })
-    push({
-      dataSecret: tp.dataSecret,
-      dataSecretIV: tp.dataSecretIV,
-      sigSecret: tp.sigSecret,
-    })
-  }
-  return out
 }
 
 /** Data 参与签名的字符串：加密时为 Base64 原文；未加密 JSON 时为与对端一致的序列化串 */
@@ -136,7 +129,7 @@ function extractDataRawForSig(body: Record<string, unknown>): string {
 }
 
 /**
- * 按请求 OperatorID 匹配秘钥，验签（HMAC-MD5）通过后解密 Data（AES-128-CBC）。
+ * 使用本地配置验签（HMAC-MD5）并解密 Data（AES-128-CBC）。
  */
 function parseInboundEnvelope(
   body: Record<string, unknown>,
@@ -159,29 +152,24 @@ function parseInboundEnvelope(
     dataObj: {},
   }
 
-  for (const secrets of inboundSecretCandidates(link, operatorId)) {
-    if (
-      !verifyEnvelopeSig(operatorId, dataRaw, timeStamp, seq, sig, secrets.sigSecret)
-    ) {
-      continue
-    }
-    let dataObj: Record<string, unknown> = {}
-    try {
-      if (encrypt && typeof rawData === 'string' && rawData.length > 0) {
-        const plain = decryptDataBase64(rawData, secrets.dataSecret, secrets.dataSecretIV)
-        dataObj = JSON.parse(plain) as Record<string, unknown>
-      } else if (rawData && typeof rawData === 'object') {
-        dataObj = rawData as Record<string, unknown>
-      } else if (typeof rawData === 'string') {
-        dataObj = JSON.parse(rawData) as Record<string, unknown>
-      }
-    } catch {
-      continue
-    }
-    return { ok: true, parsed: { ...base, dataObj } }
+  const secrets = inboundLocalSecrets(link)
+  if (!verifyEnvelopeSig(operatorId, dataRaw, timeStamp, seq, sig, secrets.sigSecret)) {
+    return { ok: false, parsed: { ...base, dataObj: {} } }
   }
-
-  return { ok: false, parsed: { ...base, dataObj: {} } }
+  let dataObj: Record<string, unknown> = {}
+  try {
+    if (encrypt && typeof rawData === 'string' && rawData.length > 0) {
+      const plain = decryptDataBase64(rawData, secrets.dataSecret, secrets.dataSecretIV)
+      dataObj = JSON.parse(plain) as Record<string, unknown>
+    } else if (rawData && typeof rawData === 'object') {
+      dataObj = rawData as Record<string, unknown>
+    } else if (typeof rawData === 'string') {
+      dataObj = JSON.parse(rawData) as Record<string, unknown>
+    }
+  } catch {
+    return { ok: false, parsed: { ...base, dataObj: {} } }
+  }
+  return { ok: true, parsed: { ...base, dataObj } }
 }
 
 export function makeStartChargeSeq(operatorId: string): string {
@@ -240,6 +228,71 @@ function parseQueryStartChargeHttpResponse(
     }
   }
   return { ok: true, startChargeSeq: String(dataOut.StartChargeSeq ?? '') }
+}
+
+function parseQueryTerminalCodeHttpResponse(
+  text: string,
+  decryptSecrets: { dataSecret: string; dataSecretIV: string },
+):
+  | { ok: true; connectorId: string }
+  | { ok: false; error: string } {
+  let json: Record<string, unknown>
+  try {
+    json = JSON.parse(text) as Record<string, unknown>
+  } catch {
+    return { ok: false, error: '响应不是合法 JSON' }
+  }
+  const ret = Number(json.Ret ?? -1)
+  if (ret !== 0) {
+    return { ok: false, error: String(json.Msg ?? `Ret=${ret}`) }
+  }
+  const enc = json.Data
+  let dataOut: Record<string, unknown>
+  try {
+    if (typeof enc === 'string') {
+      const plain = decryptDataBase64(enc, decryptSecrets.dataSecret, decryptSecrets.dataSecretIV)
+      dataOut = JSON.parse(plain) as Record<string, unknown>
+    } else {
+      dataOut = (json.Data as Record<string, unknown>) ?? {}
+    }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    return { ok: false, error: `解密或解析 Data 失败: ${msg}` }
+  }
+  const succ = Number(dataOut.SuccStat ?? dataOut.succStat ?? 1)
+  if (succ !== 0) {
+    return { ok: false, error: '二维码解析失败（SuccStat=1）' }
+  }
+  const connectorId = String(dataOut.ConnectorID ?? dataOut.connectorID ?? '').trim()
+  if (!connectorId) {
+    return { ok: false, error: '解析成功但未返回 ConnectorID' }
+  }
+  return { ok: true, connectorId }
+}
+
+/** 在本对接站点数据中，根据二维码原文匹配充电设备接口编码 */
+export function resolveConnectorIdFromQrInLink(linkUuid: string, qrCode: string): string | null {
+  const qr = String(qrCode ?? '').trim()
+  if (!qr) return null
+  const snap = getCecSnapshot()
+  const mapped = snap.connectorMap[qr]
+  if (mapped?.linkUuid === linkUuid) return qr
+
+  const stations = snap.stationsByLink[linkUuid] ?? []
+  for (const st of stations) {
+    const eqs = (st as { EquipmentInfos?: { ConnectorInfos?: { ConnectorID: string }[] }[] }).EquipmentInfos
+    if (!Array.isArray(eqs)) continue
+    for (const eq of eqs) {
+      const cis = eq?.ConnectorInfos
+      if (!Array.isArray(cis)) continue
+      for (const c of cis) {
+        const cid = String(c?.ConnectorID ?? '').trim()
+        if (!cid) continue
+        if (qr === cid || qr.endsWith(cid) || qr.includes(cid)) return cid
+      }
+    }
+  }
+  return null
 }
 
 function buildResponseData(
@@ -406,6 +459,7 @@ const CEC_ROOT_POST_ACTIONS = new Set([
   'query_station_stats',
   'query_equip_auth',
   'query_equip_business_policy',
+  'query_terminal_code',
   'notification_status',
   'notification_station_status',
   'notification_equip_charge_status',
@@ -547,6 +601,15 @@ function handleQueryStationsInfo(
   }
 }
 
+function handleQueryTerminalCode(link: CecLinkConfig, parsed: ParsedEnvelope): Record<string, unknown> {
+  const qrCode = String(parsed.dataObj.QRCode ?? parsed.dataObj.qrCode ?? '').trim()
+  const connectorId = resolveConnectorIdFromQrInLink(link.linkUuid, qrCode)
+  if (!connectorId) {
+    return { ConnectorID: '', SuccStat: 1 }
+  }
+  return { ConnectorID: connectorId, SuccStat: 0 }
+}
+
 function handleQueryStartCharge(link: CecLinkConfig, parsed: ParsedEnvelope): Record<string, unknown> {
   const startChargeSeq = String(parsed.dataObj.StartChargeSeq ?? '')
   const connectorId = String(parsed.dataObj.ConnectorID ?? '')
@@ -615,44 +678,70 @@ function handleQueryStopCharge(_link: CecLinkConfig, parsed: ParsedEnvelope): Re
   }
 }
 
-function handleQueryEquipChargeStatus(link: CecLinkConfig, parsed: ParsedEnvelope): Record<string, unknown> {
-  const startChargeSeq = String(parsed.dataObj.StartChargeSeq ?? '')
+function formatProtocolDateTime(ms: number): string {
+  const d = new Date(ms)
+  const p = (n: number) => n.toString().padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+}
+
+function readChargeStatusSoc(dataOut: Record<string, unknown>): number {
+  return Number(dataOut.SOC ?? dataOut.Soc ?? dataOut.soc ?? 0)
+}
+
+function readChargeStatusServiceMoney(dataOut: Record<string, unknown>): number {
+  return Number(dataOut.SeviceMoney ?? dataOut.ServiceMoney ?? dataOut.TotalSeviceMoney ?? 0)
+}
+
+/** query_equip_charge_status 响应是否含可用充电状态（SuccStat 省略时以 StartChargeSeqStat 1~4 判定成功） */
+export function isQueryChargeStatusResponseUsable(dataOut: Record<string, unknown>): boolean {
+  const succRaw = dataOut.SuccStat ?? dataOut.succStat
+  if (succRaw !== undefined && succRaw !== null && succRaw !== '') {
+    const n = Number(succRaw)
+    return !Number.isNaN(n) && n === 0
+  }
+  return parseSyncStartChargeSeqStat(dataOut) !== null
+}
+
+function buildEquipChargeStatusPayloadFromOrder(order: CecOrderRecord): Record<string, unknown> {
+  const last = order.samples.at(-1)
+  const info = order.orderInfo
+  const endTime =
+    info?.endTime ||
+    (last?.t ? formatProtocolDateTime(last.t) : formatProtocolDateTime(order.updatedAt))
+  const connectorStatus =
+    order.protocolState === 2 || order.protocolState === 3
+      ? 3
+      : order.protocolState === 1
+        ? 2
+        : 1
+  return {
+    StartChargeSeq: order.startChargeSeq,
+    StartChargeSeqStat: order.protocolState,
+    ConnectorID: order.connectorId,
+    ConnectorStatus: connectorStatus,
+    CurrentA: last?.currentA ?? 0,
+    VoltageA: last?.voltageA ?? 0,
+    Soc: last?.soc ?? 0,
+    StartTime: info?.startTime ?? (order.createdAt ? formatProtocolDateTime(order.createdAt) : ''),
+    EndTime: endTime,
+    TotalPower: info?.totalPower ?? last?.totalPower ?? 0,
+    ElecMoney: info?.totalElecMoney ?? last?.elecMoney ?? 0,
+    SeviceMoney: info?.totalSeviceMoney ?? last?.serviceMoney ?? 0,
+    TotalMoney: info?.totalMoney ?? last?.totalMoney ?? 0,
+    SumPeriod: info?.sumPeriod ?? (info?.chargeDetails?.length ? info.chargeDetails.length : 0),
+    ChargeDetails: info?.chargeDetails ?? [],
+    SuccStat: 0,
+  }
+}
+
+function handleQueryEquipChargeStatus(_link: CecLinkConfig, parsed: ParsedEnvelope): Record<string, unknown> {
+  const startChargeSeq = String(parsed.dataObj.StartChargeSeq ?? '').trim()
   const snap = getCecSnapshot()
-  const totalMoney = Number(parsed.dataObj.TotalMoney ?? 0)
-  const totalPower = Number(parsed.dataObj.TotalPower ?? 0)
-  const orders = snap.orders.map((o) => {
-    if (o.startChargeSeq !== startChargeSeq) return o
-    const sta = Number(parsed.dataObj.StartChargeSeqStat ?? parsed.dataObj.StartChargeSeqSta ?? o.protocolState)
-    const mapped = normalizeOrderStateFromProtocol(sta)
-    const sample = {
-      t: Date.now(),
-      totalPower,
-      totalMoney,
-      elecMoney: Number(parsed.dataObj.ElecMoney ?? 0),
-      serviceMoney: Number(parsed.dataObj.SeviceMoney ?? parsed.dataObj.ServiceMoney ?? 0),
-      voltageA: Number(parsed.dataObj.VoltageA ?? 0),
-      currentA: Number(parsed.dataObj.CurrentA ?? 0),
-      soc: Number(parsed.dataObj.SOC ?? parsed.dataObj.Soc ?? 0),
-    }
-    return {
-      ...o,
-      productState: mapped.productState,
-      protocolState: mapped.protocolState,
-      updatedAt: Date.now(),
-      samples: [...o.samples, sample].slice(-2000),
-      rawEvents: [
-        ...o.rawEvents,
-        {
-          t: Date.now(),
-          direction: 'inbound' as const,
-          name: 'query_equip_charge_status',
-          payload: JSON.stringify(parsed.dataObj),
-        },
-      ].slice(-500),
-    }
-  })
-  setCecSnapshot({ ...snap, orders })
-  return { StartChargeSeq: startChargeSeq, SuccStat: 0 }
+  const order = snap.orders.find((o) => o.startChargeSeq === startChargeSeq)
+  if (!order) {
+    return { StartChargeSeq: startChargeSeq, SuccStat: 1, FailReason: 1 }
+  }
+  return buildEquipChargeStatusPayloadFromOrder(order)
 }
 
 function productStateFromStartChargeSeqSta(sta: number): CecOrderRecord['productState'] {
@@ -1022,13 +1111,17 @@ export async function dispatchCecRequest(
           response: rejectResponse,
         }),
       })
-      return { status: 403, body: rejectResponse }
+      return { status: 200, body: rejectResponse }
     }
   }
   let dataOut: Record<string, unknown>
+  let inboundResponseRet = 0
   switch (actionKey) {
     case 'query_stations_info':
       dataOut = handleQueryStationsInfo(link, parsed)
+      break
+    case 'query_terminal_code':
+      dataOut = handleQueryTerminalCode(link, parsed)
       break
     case 'query_start_charge':
       dataOut = handleQueryStartCharge(link, parsed)
@@ -1046,26 +1139,22 @@ export async function dispatchCecRequest(
       dataOut = notImplemented()
       break
     case 'query_token': {
-      const reqOid = String(parsed.dataObj.OperatorID ?? '')
-      const reqSec = String(parsed.dataObj.OperatorSecret ?? '')
-      const okLocal =
-        trimOp(reqOid) === trimOp(link.local.operatorId) && reqSec === link.local.operatorSecret
-      const okTp =
-        trimOp(reqOid) === trimOp(link.thirdParty.operatorId) &&
-        reqSec === link.thirdParty.operatorSecret
-      const oidOut = okLocal ? link.local.operatorId : link.thirdParty.operatorId
-      if (!okLocal && !okTp) {
+      const { reqOid, reqSec } = extractQueryTokenRequestFields(parsed.dataObj, parsed.operatorId)
+      const authOk = matchInboundQueryTokenCredentials(link, reqOid, reqSec)
+      if (!authOk) {
+        const oidKnown = trimOp(reqOid) === trimOp(link.thirdParty.operatorId)
         dataOut = {
           OperatorID: reqOid || parsed.operatorId,
           SuccStat: 1,
           AccessToken: '',
           TokenAvailableTime: 0,
-          FailReason: 2,
+          FailReason: oidKnown ? 2 : 1,
         }
+        inboundResponseRet = 4003
       } else {
         const tokenEntry = issueInboundAuthTokenForLink(link.linkUuid)
         dataOut = {
-          OperatorID: oidOut,
+          OperatorID: link.thirdParty.operatorId,
           SuccStat: 0,
           AccessToken: tokenEntry.accessToken,
           TokenAvailableTime: Math.floor((tokenEntry.expiresAtMs - tokenEntry.issuedAtMs) / 1000),
@@ -1097,7 +1186,7 @@ export async function dispatchCecRequest(
       return { status: 404, body: { Ret: 404, Msg: 'action', Sig: '', Data: {} } }
   }
   /** 服务平台应答：Data 加解密与 Sig 使用本地（玖行侧）秘钥，与附件 §4.2 查询类一致 */
-  const resp = buildResponseData(0, '', dataOut, link.local, encrypt)
+  const resp = buildResponseData(inboundResponseRet, '', dataOut, link.local, encrypt)
   pushLog({
     t: Date.now(),
     direction: 'inbound',
@@ -1197,11 +1286,11 @@ export type CecPullStationsProgress = {
 const THIRD_PARTY_TOKEN_SKEW_MS = 60_000
 
 /**
- * 主动调用对方互联互通接口（除 query_token 以外）：
+ * 主动调用对端互联互通接口（除 query_token 以外）：
  * - OperatorID 使用本地平台编码（本地为空时回退 thirdParty）
- * - 签名与 Data 加解密使用 thirdParty 密钥（为空时回退 local，兼容旧配置）
+ * - 签名与 Data 加解密优先使用三方配置秘钥（为空时回退 local，兼容旧配置）
  */
-function outboundPlatformSecrets(link: CecLinkConfig): {
+export function outboundPlatformSecrets(link: CecLinkConfig): {
   operatorId: string
   operatorSecret: string
   sigSecret: string
@@ -1220,11 +1309,70 @@ function outboundPlatformSecrets(link: CecLinkConfig): {
   }
 }
 
-function invalidateThirdPartyToken(linkUuid: string): void {
+function validateOutboundCryptoSecrets(link: CecLinkConfig): string | null {
+  const s = outboundPlatformSecrets(link)
+  if (!String(s.operatorId ?? '').trim()) {
+    return '平台编码（OperatorID）为空，请完善本地或三方配置'
+  }
+  if (!String(s.sigSecret ?? '').trim()) return 'SigSecret 为空，请完善三方或本地配置'
+  if (!String(s.operatorSecret ?? '').trim()) return 'OperatorSecret 为空，请完善三方配置'
+  const aesErr = validateCecAesSecretPair(s.dataSecret, s.dataSecretIV)
+  if (aesErr) {
+    return `DataSecret/DataSecretIV 无效（须各为 16 字节 UTF-8）：${aesErr}`
+  }
+  return null
+}
+
+/**
+ * query_token 专用出站秘钥（与 outboundPlatformSecrets 分离，保持历史联调行为）：
+ * - 信封 OperatorID：本地平台编码
+ * - Data 内 OperatorSecret 及签名/加解密：三方配置秘钥
+ */
+export function queryTokenOutboundSecrets(link: CecLinkConfig): {
+  operatorId: string
+  operatorSecret: string
+  sigSecret: string
+  dataSecret: string
+  dataSecretIV: string
+} {
+  const loc = link.local
+  const tp = link.thirdParty
+  return {
+    operatorId: String(loc.operatorId ?? '').trim(),
+    operatorSecret: tp.operatorSecret,
+    sigSecret: tp.sigSecret,
+    dataSecret: tp.dataSecret,
+    dataSecretIV: tp.dataSecretIV,
+  }
+}
+
+function validateQueryTokenOutboundSecrets(link: CecLinkConfig): string | null {
+  const s = queryTokenOutboundSecrets(link)
+  if (!String(s.operatorId ?? '').trim()) {
+    return '本地平台编码（OperatorID）为空，无法发起 query_token；请完善本地配置'
+  }
+  if (!String(s.operatorSecret ?? '').trim()) return 'OperatorSecret 为空，请完善三方配置'
+  if (!String(s.sigSecret ?? '').trim()) return 'SigSecret 为空，请完善三方配置'
+  const aesErr = validateCecAesSecretPair(s.dataSecret, s.dataSecretIV)
+  if (aesErr) {
+    return `DataSecret/DataSecretIV 无效（须各为 16 字节 UTF-8）：${aesErr}`
+  }
+  return null
+}
+
+export function invalidateThirdPartyToken(linkUuid: string): void {
   const snap = getCecSnapshot()
   const next = { ...snap.thirdPartyTokenByLink }
   delete next[linkUuid]
   patchCecSnapshot({ thirdPartyTokenByLink: next })
+}
+
+/** 清除本机签发给对端的 inbound Bearer token 缓存 */
+export function invalidateInboundAuthToken(linkUuid: string): void {
+  const snap = getCecSnapshot()
+  const next = { ...(snap.inboundAuthTokenByLink ?? {}) }
+  delete next[linkUuid]
+  patchCecSnapshot({ inboundAuthTokenByLink: next })
 }
 
 /** 调用第三方 query_token，写入 thirdPartyTokenByLink */
@@ -1238,16 +1386,10 @@ async function fetchThirdPartyQueryToken(
   const url = `${base}/query_token`
   const ts = formatTs(new Date())
   const seq = '0001'
-  // query_token：OperatorID 使用本地平台值；签名与加解密仍按对方平台秘钥请求。
-  const s = {
-    operatorId: link.local.operatorId,
-    operatorSecret: link.thirdParty.operatorSecret,
-    sigSecret: link.thirdParty.sigSecret,
-    dataSecret: link.thirdParty.dataSecret,
-    dataSecretIV: link.thirdParty.dataSecretIV,
-  }
-  if (!String(s.operatorId ?? '').trim()) {
-    return { ok: false, error: '本地平台编码（OperatorID）为空，无法发起 query_token；请完善本地配置' }
+  const s = queryTokenOutboundSecrets(link)
+  const cryptoErr = validateQueryTokenOutboundSecrets(link)
+  if (cryptoErr) {
+    return { ok: false, error: cryptoErr }
   }
   const dataObj: Record<string, unknown> = {
     OperatorID: s.operatorId,
@@ -1356,11 +1498,87 @@ async function ensureThirdPartyAccessTokenForLinkUuid(
   return t
 }
 
-function isLikelyTokenBusinessFailure(ret: number, json: Record<string, unknown>): boolean {
+export function isLikelyTokenBusinessFailure(ret: number, json: Record<string, unknown>): boolean {
   const msg = String(json.Msg ?? '')
-  if ([4005, 4006, 4010].includes(ret)) return true
-  if (/token|Token|令牌|鉴权|登录|access|过期|失效/i.test(msg)) return true
+  // 4002：对端 token 无效/过期（与本机 inbound 拒 token 的 Ret 一致）
+  if ([4002, 4005, 4006, 4010].includes(ret)) return true
+  if (/token|Token|令牌|鉴权|登录|access|过期|失效|未获取|没有/i.test(msg)) return true
   return false
+}
+
+type OutboundFetchAttempt = {
+  httpStatus: number
+  responseText: string
+}
+
+type OutboundJsonRetryResult =
+  | { ok: true; json: Record<string, unknown>; httpStatus: number; responseText: string }
+  | {
+      ok: false
+      error: string
+      json?: Record<string, unknown>
+      httpStatus?: number
+      responseText?: string
+    }
+
+/**
+ * 向外 HTTP：缓存无 token 时先 query_token；响应 Ret 表明 token 失效（含 4002）时刷新 token 并重试一次。
+ */
+async function fetchThirdPartyJsonWithTokenRetry(
+  linkUuid: string,
+  fetchOnce: (accessToken: string) => Promise<OutboundFetchAttempt>,
+): Promise<OutboundJsonRetryResult> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let accessToken: string
+    try {
+      accessToken = await ensureThirdPartyAccessTokenForLinkUuid(linkUuid, attempt > 0)
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      return { ok: false, error: `获取 token 失败: ${msg}` }
+    }
+    if (!String(accessToken ?? '').trim()) {
+      invalidateThirdPartyToken(linkUuid)
+      if (attempt === 0) continue
+      return { ok: false, error: 'token 为空' }
+    }
+
+    let httpStatus: number
+    let responseText: string
+    try {
+      const res = await fetchOnce(accessToken)
+      httpStatus = res.httpStatus
+      responseText = res.responseText
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      return { ok: false, error: msg }
+    }
+
+    let json: Record<string, unknown>
+    try {
+      json = JSON.parse(responseText) as Record<string, unknown>
+    } catch {
+      return { ok: false, error: '响应不是合法 JSON', httpStatus, responseText }
+    }
+
+    const ret = Number(json.Ret ?? -1)
+    if (ret === 0) {
+      return { ok: true, json, httpStatus, responseText }
+    }
+
+    if (attempt < 1 && isLikelyTokenBusinessFailure(ret, json)) {
+      invalidateThirdPartyToken(linkUuid)
+      continue
+    }
+
+    return {
+      ok: false,
+      error: String(json.Msg ?? `Ret=${ret}`),
+      json,
+      httpStatus,
+      responseText,
+    }
+  }
+  return { ok: false, error: '请求失败' }
 }
 
 function buildQueryStationsRequestBody(link: CecLinkConfig, pageNo: number, pageSize: number) {
@@ -1565,21 +1783,9 @@ export async function pullStationsFromThirdParty(
   try {
     for (;;) {
       const { body, dataObj } = buildQueryStationsRequestBody(link, pageNo, pageSize)
-      let res: Response
-      let text: string
-      let json: Record<string, unknown>
-      let tokenRetry = 0
-      let pageOk = false
-      while (!pageOk) {
-        let token: string
+      const attempt = await fetchThirdPartyJsonWithTokenRetry(link.linkUuid, async (token) => {
         try {
-          token = await ensureThirdPartyAccessTokenForLinkUuid(link.linkUuid, tokenRetry > 0)
-        } catch (e) {
-          const msg = e instanceof Error ? e.message : String(e)
-          return { ok: false, error: `获取 token 失败: ${msg}` }
-        }
-        try {
-          res = await fetch(url, {
+          const res = await fetch(url, {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json; charset=utf-8',
@@ -1587,41 +1793,32 @@ export async function pullStationsFromThirdParty(
             },
             body: JSON.stringify(body),
           })
-          text = await res.text()
+          return { httpStatus: res.status, responseText: await res.text() }
         } catch (fetchErr) {
-          const errMsg =
-            fetchErr instanceof Error ? fetchErr.message : String(fetchErr)
+          const errMsg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr)
           const hint =
             errMsg.includes('fetch failed') || errMsg === 'Failed to fetch'
               ? `${errMsg}（常见原因：地址不可达、端口未开放、HTTPS 证书、或本机未启动对端服务）`
               : errMsg
-          logPullAttempt(url, pageNo, body, dataObj, { ok: false, error: hint })
-          return { ok: false, error: `网络请求失败: ${hint}` }
+          throw new Error(hint)
         }
+      })
 
-        logPullAttempt(url, pageNo, body, dataObj, { ok: true, status: res.status, responseText: text }, pullSecrets)
-
-        try {
-          json = JSON.parse(text) as Record<string, unknown>
-        } catch {
-          return {
-            ok: false,
-            error: `响应不是合法 JSON（HTTP ${res.status}），请检查 URL 是否与对端开放平台一致`,
-          }
-        }
-
-        const ret = Number(json.Ret ?? -1)
-        if (ret === 0) {
-          pageOk = true
-          break
-        }
-        if (tokenRetry < 1 && isLikelyTokenBusinessFailure(ret, json)) {
-          invalidateThirdPartyToken(link.linkUuid)
-          tokenRetry += 1
-          continue
-        }
-        return { ok: false, error: String(json.Msg ?? 'Ret') }
+      if (!attempt.ok) {
+        logPullAttempt(url, pageNo, body, dataObj, { ok: false, error: attempt.error })
+        return { ok: false, error: attempt.error.startsWith('获取 token 失败') ? attempt.error : `网络请求失败: ${attempt.error}` }
       }
+
+      logPullAttempt(
+        url,
+        pageNo,
+        body,
+        dataObj,
+        { ok: true, status: attempt.httpStatus, responseText: attempt.responseText },
+        pullSecrets,
+      )
+
+      const json = attempt.json
       const enc = json.Data
       let dataOut: Record<string, unknown>
       try {
@@ -1739,57 +1936,74 @@ function isOrderFinishedByProtocolState(o: CecOrderRecord): boolean {
   return o.protocolState === 4 || o.productState === 'completed'
 }
 
-function applyChargeStatusToOrder(
+/** 订单状态同步：仅 1~4 为有效 StartChargeSeqStat，5 及其他值不更新本地订单 */
+function parseSyncStartChargeSeqStat(dataOut: Record<string, unknown>): 1 | 2 | 3 | 4 | null {
+  const raw = dataOut.StartChargeSeqStat ?? dataOut.StartChargeSeqSta
+  if (raw === undefined || raw === null || raw === '') return null
+  const n = Number(raw)
+  if (n >= 1 && n <= 4) return n as 1 | 2 | 3 | 4
+  return null
+}
+
+function buildCompletedOrderInfoFromChargeStatus(
+  order: CecOrderRecord,
+  dataOut: Record<string, unknown>,
+): NonNullable<CecOrderRecord['orderInfo']> {
+  const totalPower = Number(dataOut.TotalPower ?? 0)
+  const totalMoney = Number(dataOut.TotalMoney ?? 0)
+  const totalElecMoney = Number(dataOut.ElecMoney ?? dataOut.TotalElecMoney ?? 0)
+  const totalSeviceMoney = readChargeStatusServiceMoney(dataOut)
+  return {
+    ...(order.orderInfo ?? {
+      startChargeSeq: order.startChargeSeq,
+      connectorId: order.connectorId,
+      totalPower: 0,
+      totalElecMoney: 0,
+      totalSeviceMoney: 0,
+      totalMoney: 0,
+    }),
+    startChargeSeq: String(dataOut.StartChargeSeq ?? order.startChargeSeq).trim() || order.startChargeSeq,
+    connectorId: String(dataOut.ConnectorID ?? order.connectorId).trim() || order.connectorId,
+    totalPower,
+    totalElecMoney,
+    totalSeviceMoney,
+    totalMoney,
+    stopReason:
+      dataOut.StopReason != null && dataOut.StopReason !== ''
+        ? Number(dataOut.StopReason)
+        : order.orderInfo?.stopReason,
+    sumPeriod:
+      dataOut.SumPeriod != null && dataOut.SumPeriod !== ''
+        ? Number(dataOut.SumPeriod)
+        : Array.isArray(dataOut.ChargeDetails)
+          ? dataOut.ChargeDetails.length
+          : order.orderInfo?.sumPeriod,
+    chargeDetails: Array.isArray(dataOut.ChargeDetails)
+      ? (dataOut.ChargeDetails as unknown[])
+      : (order.orderInfo?.chargeDetails ?? []),
+    startTime: String(dataOut.StartTime ?? order.orderInfo?.startTime ?? '').trim() || order.orderInfo?.startTime,
+    endTime: String(dataOut.EndTime ?? order.orderInfo?.endTime ?? '').trim() || order.orderInfo?.endTime,
+  }
+}
+
+export function applyChargeStatusToOrder(
   order: CecOrderRecord,
   dataOut: Record<string, unknown>,
   now: number,
 ): CecOrderRecord {
-  const staRaw = Number(dataOut.StartChargeSeqStat ?? dataOut.StartChargeSeqSta ?? order.protocolState)
-  const mapped = normalizeOrderStateFromProtocol(staRaw)
-  const canUpdateState = canAdvanceOrderStateByNotification(order, mapped.protocolState)
-  const currentEnded = isOrderFinishedByProtocolState(order)
-  const nextEnded = mapped.protocolState === 4
-  const shouldPatchOrderInfo = nextEnded && !currentEnded
+  const sta = parseSyncStartChargeSeqStat(dataOut)
+  if (sta === null) return order
+
   const totalPower = Number(dataOut.TotalPower ?? 0)
   const totalMoney = Number(dataOut.TotalMoney ?? 0)
   const totalElecMoney = Number(dataOut.ElecMoney ?? dataOut.TotalElecMoney ?? 0)
-  const totalSeviceMoney = Number(dataOut.SeviceMoney ?? dataOut.ServiceMoney ?? dataOut.TotalSeviceMoney ?? 0)
-  const nextOrderInfo = shouldPatchOrderInfo
-    ? {
-        ...(order.orderInfo ?? {
-          startChargeSeq: order.startChargeSeq,
-          connectorId: order.connectorId,
-          totalPower: 0,
-          totalElecMoney: 0,
-          totalSeviceMoney: 0,
-          totalMoney: 0,
-        }),
-        startChargeSeq: String(dataOut.StartChargeSeq ?? order.startChargeSeq).trim() || order.startChargeSeq,
-        connectorId: String(dataOut.ConnectorID ?? order.connectorId).trim() || order.connectorId,
-        totalPower,
-        totalElecMoney,
-        totalSeviceMoney,
-        totalMoney,
-        stopReason:
-          dataOut.StopReason != null && dataOut.StopReason !== ''
-            ? Number(dataOut.StopReason)
-            : order.orderInfo?.stopReason,
-        sumPeriod:
-          dataOut.SumPeriod != null && dataOut.SumPeriod !== ''
-            ? Number(dataOut.SumPeriod)
-            : order.orderInfo?.sumPeriod,
-        chargeDetails: Array.isArray(dataOut.ChargeDetails)
-          ? (dataOut.ChargeDetails as unknown[])
-          : (order.orderInfo?.chargeDetails ?? []),
-        startTime: String(dataOut.StartTime ?? order.orderInfo?.startTime ?? '').trim() || order.orderInfo?.startTime,
-        endTime: String(dataOut.EndTime ?? order.orderInfo?.endTime ?? '').trim() || order.orderInfo?.endTime,
-      }
-    : order.orderInfo
+  const totalSeviceMoney = readChargeStatusServiceMoney(dataOut)
+  const nextOrderInfo = sta === 4 ? buildCompletedOrderInfoFromChargeStatus(order, dataOut) : order.orderInfo
   return {
     ...order,
-    protocolState: canUpdateState ? mapped.protocolState : order.protocolState,
-    productState: canUpdateState ? mapped.productState : order.productState,
-    suspendAt: canUpdateState ? undefined : order.suspendAt,
+    protocolState: sta,
+    productState: productStateFromStartChargeSeqSta(sta),
+    suspendAt: sta >= 2 ? undefined : order.suspendAt,
     updatedAt: now,
     samples: [
       ...order.samples,
@@ -1801,7 +2015,7 @@ function applyChargeStatusToOrder(
         serviceMoney: totalSeviceMoney,
         voltageA: Number(dataOut.VoltageA ?? 0),
         currentA: Number(dataOut.CurrentA ?? 0),
-        soc: Number(dataOut.SOC ?? dataOut.Soc ?? 0),
+        soc: readChargeStatusSoc(dataOut),
       },
     ].slice(-2000),
     rawEvents: [
@@ -1825,142 +2039,102 @@ export async function queryEquipBusinessPolicyFromThirdParty(
   linkUuid: string,
   connectorId: string,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
-  const link = getCecLinkByUuid(linkUuid)
-  if (!link) return { ok: false, error: '未找到配置' }
-  const base = thirdPartyOutboundBase(link.thirdParty)
-  if (!base || !/^https?:\/\//i.test(base)) {
-    return {
-      ok: false,
-      error: '第三方互联互通地址无效，请填写以 http:// 或 https:// 开头的根地址',
-    }
-  }
-  const url = `${base.replace(/\/$/, '')}/query_equip_business_policy`
-  const pullSecrets = outboundPlatformSecrets(link)
-  if (!String(pullSecrets.operatorId ?? '').trim()) {
-    return { ok: false, error: '平台编码（OperatorID）为空，无法签名 query_equip_business_policy' }
-  }
-  const cid = String(connectorId ?? '').trim()
-  if (!cid) return { ok: false, error: 'ConnectorID 为空' }
-
-  const policyCacheKey = `${linkUuid}::${cid}`
-
-  const equipBizSeq = makeStartChargeSeq(pullSecrets.operatorId)
-  const dataObj: Record<string, unknown> = {
-    EquipBizSeq: equipBizSeq,
-    ConnectorID: cid,
-  }
-  const ts = formatTs(new Date())
-  const seq = '0001'
-  const dataStr = encryptDataJson(JSON.stringify(dataObj), pullSecrets.dataSecret, pullSecrets.dataSecretIV)
-  const body = {
-    OperatorID: pullSecrets.operatorId,
-    TimeStamp: ts,
-    Seq: seq,
-    Sig: signEnvelope(pullSecrets.operatorId, dataStr, ts, seq, pullSecrets.sigSecret),
-    Data: dataStr,
-  }
-
-  const patchPolicy = (entry: CecEquipBusinessPolicyCache) => {
-    const snap = getCecSnapshot()
-    setCecSnapshot({
-      ...snap,
-      equipBusinessPolicyByKey: {
-        ...(snap.equipBusinessPolicyByKey ?? {}),
-        [policyCacheKey]: entry,
-      },
-    })
-  }
-
-  let tokenRetry = 0
-  let lastError = ''
-
-  while (tokenRetry < 2) {
-    let token: string
-    try {
-      token = await ensureThirdPartyAccessTokenForLinkUuid(link.linkUuid, tokenRetry > 0)
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e)
-      patchPolicy({
-        linkUuid,
-        connectorId: cid,
-        fetchedAt: Date.now(),
-        errorMessage: `获取 token 失败: ${msg}`,
-      })
-      return { ok: false, error: `获取 token 失败: ${msg}` }
-    }
-
-    let res: Response
-    let text: string
-    try {
-      res = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json; charset=utf-8',
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify(body),
-      })
-      text = await res.text()
-    } catch (fetchErr) {
-      const errMsg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr)
-      const hint =
-        errMsg.includes('fetch failed') || errMsg === 'Failed to fetch'
-          ? `${errMsg}（常见原因：地址不可达、端口未开放）`
-          : errMsg
-      pushOutboundHttpLog('query_equip_business_policy', 'fetch 失败', url, body, dataObj, {
+  try {
+    const link = getCecLinkByUuid(linkUuid)
+    if (!link) return { ok: false, error: '未找到配置' }
+    const base = thirdPartyOutboundBase(link.thirdParty)
+    if (!base || !/^https?:\/\//i.test(base)) {
+      return {
         ok: false,
-        error: hint,
+        error: '第三方互联互通地址无效，请填写以 http:// 或 https:// 开头的根地址',
+      }
+    }
+    const cryptoErr = validateOutboundCryptoSecrets(link)
+    if (cryptoErr) return { ok: false, error: cryptoErr }
+    const url = `${base.replace(/\/$/, '')}/query_equip_business_policy`
+    const pullSecrets = outboundPlatformSecrets(link)
+    const cid = String(connectorId ?? '').trim()
+    if (!cid) return { ok: false, error: 'ConnectorID 为空' }
+
+    const policyCacheKey = `${linkUuid}::${cid}`
+
+    const equipBizSeq = makeStartChargeSeq(pullSecrets.operatorId)
+    const dataObj: Record<string, unknown> = {
+      EquipBizSeq: equipBizSeq,
+      ConnectorID: cid,
+    }
+    const ts = formatTs(new Date())
+    const seq = '0001'
+    const dataStr = encryptDataJson(JSON.stringify(dataObj), pullSecrets.dataSecret, pullSecrets.dataSecretIV)
+    const body = {
+      OperatorID: pullSecrets.operatorId,
+      TimeStamp: ts,
+      Seq: seq,
+      Sig: signEnvelope(pullSecrets.operatorId, dataStr, ts, seq, pullSecrets.sigSecret),
+      Data: dataStr,
+    }
+
+    const patchPolicy = (entry: CecEquipBusinessPolicyCache) => {
+      const snap = getCecSnapshot()
+      setCecSnapshot({
+        ...snap,
+        equipBusinessPolicyByKey: {
+          ...(snap.equipBusinessPolicyByKey ?? {}),
+          [policyCacheKey]: entry,
+        },
       })
+    }
+
+    const attempt = await fetchThirdPartyJsonWithTokenRetry(link.linkUuid, async (token) => {
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json; charset=utf-8',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify(body),
+        })
+        return { httpStatus: res.status, responseText: await res.text() }
+      } catch (fetchErr) {
+        const errMsg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr)
+        const hint =
+          errMsg.includes('fetch failed') || errMsg === 'Failed to fetch'
+            ? `${errMsg}（常见原因：地址不可达、端口未开放）`
+            : errMsg
+        throw new Error(hint)
+      }
+    })
+
+    if (!attempt.ok) {
+      pushOutboundHttpLog(
+        'query_equip_business_policy',
+        attempt.httpStatus != null ? String(attempt.httpStatus) : 'fetch 失败',
+        url,
+        body,
+        dataObj,
+        { ok: false, error: attempt.error },
+      )
       patchPolicy({
         linkUuid,
         connectorId: cid,
         fetchedAt: Date.now(),
-        errorMessage: hint,
+        errorMessage: attempt.error,
       })
-      return { ok: false, error: hint }
+      return { ok: false, error: attempt.error }
     }
 
     pushOutboundHttpLog(
       'query_equip_business_policy',
-      String(res.status),
+      String(attempt.httpStatus),
       url,
       body,
       dataObj,
-      { ok: true, status: res.status, responseText: text },
+      { ok: true, status: attempt.httpStatus, responseText: attempt.responseText },
       { responseDecrypt: { dataSecret: pullSecrets.dataSecret, dataSecretIV: pullSecrets.dataSecretIV } },
     )
 
-    let json: Record<string, unknown>
-    try {
-      json = JSON.parse(text) as Record<string, unknown>
-    } catch {
-      lastError = '响应不是合法 JSON'
-      patchPolicy({
-        linkUuid,
-        connectorId: cid,
-        fetchedAt: Date.now(),
-        errorMessage: lastError,
-      })
-      return { ok: false, error: lastError }
-    }
-
-    const ret = Number(json.Ret ?? -1)
-    if (ret !== 0) {
-      if (tokenRetry < 1 && isLikelyTokenBusinessFailure(ret, json)) {
-        invalidateThirdPartyToken(link.linkUuid)
-        tokenRetry += 1
-        continue
-      }
-      lastError = String(json.Msg ?? `Ret=${ret}`)
-      patchPolicy({
-        linkUuid,
-        connectorId: cid,
-        fetchedAt: Date.now(),
-        errorMessage: lastError,
-      })
-      return { ok: false, error: lastError }
-    }
-
+    const json = attempt.json
     const enc = json.Data
     let dataOut: Record<string, unknown>
     try {
@@ -2006,9 +2180,10 @@ export async function queryEquipBusinessPolicyFromThirdParty(
       return { ok: false, error: bizErr ?? '业务失败' }
     }
     return { ok: true }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    return { ok: false, error: msg }
   }
-
-  return { ok: false, error: lastError || 'query_equip_business_policy 未返回有效结果' }
 }
 
 function parseConnectorStatusInfosFromPayload(raw: unknown): CecConnectorStatusInfo[] {
@@ -2085,25 +2260,9 @@ export async function queryStationStatusFromThirdParty(
     setCecSnapshot({ ...snap, stationStatusByKey: next })
   }
 
-  let tokenRetry = 0
-  while (tokenRetry < 2) {
-    let token: string
+  const attempt = await fetchThirdPartyJsonWithTokenRetry(link.linkUuid, async (token) => {
     try {
-      token = await ensureThirdPartyAccessTokenForLinkUuid(link.linkUuid, tokenRetry > 0)
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e)
-      patchLocalOrder({
-        productState: 'start_failed',
-        protocolState: 5,
-        suspendAt: undefined,
-      })
-      return { ok: false, error: `获取 token 失败: ${msg}` }
-    }
-
-    let res: Response
-    let text: string
-    try {
-      res = await fetch(url, {
+      const res = await fetch(url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json; charset=utf-8',
@@ -2111,97 +2270,87 @@ export async function queryStationStatusFromThirdParty(
         },
         body: JSON.stringify(body),
       })
-      text = await res.text()
+      return { httpStatus: res.status, responseText: await res.text() }
     } catch (fetchErr) {
       const errMsg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr)
       const hint =
         errMsg.includes('fetch failed') || errMsg === 'Failed to fetch'
           ? `${errMsg}（常见原因：地址不可达、端口未开放）`
           : errMsg
-      pushOutboundHttpLog('query_station_status', 'fetch 失败', url, body, dataObj, {
-        ok: false,
-        error: hint,
-      })
-      return { ok: false, error: hint }
+      throw new Error(hint)
     }
+  })
 
+  if (!attempt.ok) {
     pushOutboundHttpLog(
       'query_station_status',
-      String(res.status),
+      attempt.httpStatus != null ? String(attempt.httpStatus) : 'fetch 失败',
       url,
       body,
       dataObj,
-      {
-        ok: true,
-        status: res.status,
-        responseText: text,
-      },
-      { responseDecrypt: { dataSecret: pullSecrets.dataSecret, dataSecretIV: pullSecrets.dataSecretIV } },
+      { ok: false, error: attempt.error },
     )
-
-    let json: Record<string, unknown>
-    try {
-      json = JSON.parse(text) as Record<string, unknown>
-    } catch {
-      return { ok: false, error: '响应不是合法 JSON' }
-    }
-
-    const ret = Number(json.Ret ?? -1)
-    if (ret !== 0) {
-      if (tokenRetry < 1 && isLikelyTokenBusinessFailure(ret, json)) {
-        invalidateThirdPartyToken(link.linkUuid)
-        tokenRetry += 1
-        continue
-      }
-      return { ok: false, error: String(json.Msg ?? `Ret=${ret}`) }
-    }
-
-    const enc = json.Data
-    let dataOut: Record<string, unknown>
-    try {
-      if (typeof enc === 'string') {
-        const plain = decryptDataBase64(enc, pullSecrets.dataSecret, pullSecrets.dataSecretIV)
-        dataOut = JSON.parse(plain) as Record<string, unknown>
-      } else {
-        dataOut = (json.Data as Record<string, unknown>) ?? {}
-      }
-    } catch (decErr) {
-      const msg = decErr instanceof Error ? decErr.message : String(decErr)
-      return { ok: false, error: `解密或解析 Data 失败: ${msg}` }
-    }
-
-    const rawList =
-      dataOut.StationStatusInfos ??
-      dataOut.stationStatusInfos ??
-      (Array.isArray(dataOut.StationStatusInfo) ? dataOut.StationStatusInfo : undefined)
-
-    let list: Record<string, unknown>[]
-    if (Array.isArray(rawList)) {
-      list = rawList as Record<string, unknown>[]
-    } else if (rawList && typeof rawList === 'object') {
-      list = [rawList as Record<string, unknown>]
-    } else {
-      list = []
-    }
-
-    const entries: CecStationStatusCache[] = []
-    for (const st of list) {
-      const sid = String(st.StationID ?? st.stationID ?? '').trim()
-      if (!sid) continue
-      const infos = parseConnectorStatusInfosFromPayload(st.ConnectorStatusInfos ?? st.connectorStatusInfos)
-      entries.push({
-        linkUuid,
-        StationID: sid,
-        ConnectorStatusInfos: infos,
-        fetchedAt: Date.now(),
-      })
-    }
-
-    patchStatus(entries)
-    return { ok: true }
+    return { ok: false, error: attempt.error }
   }
 
-  return { ok: false, error: 'query_station_status 未返回有效结果' }
+  pushOutboundHttpLog(
+    'query_station_status',
+    String(attempt.httpStatus),
+    url,
+    body,
+    dataObj,
+    {
+      ok: true,
+      status: attempt.httpStatus,
+      responseText: attempt.responseText,
+    },
+    { responseDecrypt: { dataSecret: pullSecrets.dataSecret, dataSecretIV: pullSecrets.dataSecretIV } },
+  )
+
+  const json = attempt.json
+  const enc = json.Data
+  let dataOut: Record<string, unknown>
+  try {
+    if (typeof enc === 'string') {
+      const plain = decryptDataBase64(enc, pullSecrets.dataSecret, pullSecrets.dataSecretIV)
+      dataOut = JSON.parse(plain) as Record<string, unknown>
+    } else {
+      dataOut = (json.Data as Record<string, unknown>) ?? {}
+    }
+  } catch (decErr) {
+    const msg = decErr instanceof Error ? decErr.message : String(decErr)
+    return { ok: false, error: `解密或解析 Data 失败: ${msg}` }
+  }
+
+  const rawList =
+    dataOut.StationStatusInfos ??
+    dataOut.stationStatusInfos ??
+    (Array.isArray(dataOut.StationStatusInfo) ? dataOut.StationStatusInfo : undefined)
+
+  let list: Record<string, unknown>[]
+  if (Array.isArray(rawList)) {
+    list = rawList as Record<string, unknown>[]
+  } else if (rawList && typeof rawList === 'object') {
+    list = [rawList as Record<string, unknown>]
+  } else {
+    list = []
+  }
+
+  const entries: CecStationStatusCache[] = []
+  for (const st of list) {
+    const sid = String(st.StationID ?? st.stationID ?? '').trim()
+    if (!sid) continue
+    const infos = parseConnectorStatusInfosFromPayload(st.ConnectorStatusInfos ?? st.connectorStatusInfos)
+    entries.push({
+      linkUuid,
+      StationID: sid,
+      ConnectorStatusInfos: infos,
+      fetchedAt: Date.now(),
+    })
+  }
+
+  patchStatus(entries)
+  return { ok: true }
 }
 
 /** 模拟第三方调用对端服务平台的 query_stop_charge（互联互通根地址 + outboundPlatformSecrets + Bearer，与 query_stations_info 一致） */
@@ -2242,20 +2391,9 @@ export async function postLocalQueryStopCharge(
     Data: dataStr,
   }
 
-  let tokenRetry = 0
-  while (tokenRetry < 2) {
-    let token: string
+  const attempt = await fetchThirdPartyJsonWithTokenRetry(link.linkUuid, async (token) => {
     try {
-      token = await ensureThirdPartyAccessTokenForLinkUuid(link.linkUuid, tokenRetry > 0)
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e)
-      return { ok: false, error: `获取 token 失败: ${msg}` }
-    }
-
-    let res: Response
-    let text: string
-    try {
-      res = await fetch(url, {
+      const res = await fetch(url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json; charset=utf-8',
@@ -2263,70 +2401,65 @@ export async function postLocalQueryStopCharge(
         },
         body: JSON.stringify(body),
       })
-      text = await res.text()
+      return { httpStatus: res.status, responseText: await res.text() }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
       const hint =
         msg.includes('fetch failed') || msg === 'Failed to fetch'
           ? `${msg}（常见原因：地址不可达、端口未开放、HTTPS 证书、或本机未启动对端服务）`
           : msg
-      pushOutboundHttpLog('query_stop_charge', 'fetch 失败', url, body, dataObj, { ok: false, error: hint })
-      return { ok: false, error: hint }
+      throw new Error(hint)
     }
+  })
 
+  if (!attempt.ok) {
     pushOutboundHttpLog(
       'query_stop_charge',
-      String(res.status),
+      attempt.httpStatus != null ? String(attempt.httpStatus) : 'fetch 失败',
       url,
       body,
       dataObj,
-      {
-        ok: true,
-        status: res.status,
-        responseText: text,
-      },
-      { responseDecrypt: { dataSecret: pullSecrets.dataSecret, dataSecretIV: pullSecrets.dataSecretIV } },
+      { ok: false, error: attempt.error },
     )
-
-    let json: Record<string, unknown>
-    try {
-      json = JSON.parse(text) as Record<string, unknown>
-    } catch {
-      return { ok: false, error: '响应不是合法 JSON' }
-    }
-
-    const ret = Number(json.Ret ?? -1)
-    if (ret !== 0) {
-      if (tokenRetry < 1 && isLikelyTokenBusinessFailure(ret, json)) {
-        invalidateThirdPartyToken(link.linkUuid)
-        tokenRetry += 1
-        continue
-      }
-      return { ok: false, error: String(json.Msg ?? `Ret=${ret}`) }
-    }
-    let dataOut: Record<string, unknown>
-    try {
-      const enc = json.Data
-      if (typeof enc === 'string') {
-        const plain = decryptDataBase64(enc, pullSecrets.dataSecret, pullSecrets.dataSecretIV)
-        dataOut = JSON.parse(plain) as Record<string, unknown>
-      } else {
-        dataOut = (enc as Record<string, unknown>) ?? {}
-      }
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e)
-      return { ok: false, error: `停止响应解析失败: ${msg}` }
-    }
-    const succStat = Number(dataOut.SuccStat ?? 1)
-    if (succStat !== 0) {
-      const failReason = String(dataOut.FailReason ?? '')
-      return { ok: false, error: `停止失败：FailReason=${failReason || '未知'}` }
-    }
-
-    return { ok: true, text }
+    return { ok: false, error: attempt.error }
   }
 
-  return { ok: false, error: 'query_stop_charge 未返回有效结果' }
+  pushOutboundHttpLog(
+    'query_stop_charge',
+    String(attempt.httpStatus),
+    url,
+    body,
+    dataObj,
+    {
+      ok: true,
+      status: attempt.httpStatus,
+      responseText: attempt.responseText,
+    },
+    { responseDecrypt: { dataSecret: pullSecrets.dataSecret, dataSecretIV: pullSecrets.dataSecretIV } },
+  )
+
+  const json = attempt.json
+  const text = attempt.responseText
+  let dataOut: Record<string, unknown>
+  try {
+    const enc = json.Data
+    if (typeof enc === 'string') {
+      const plain = decryptDataBase64(enc, pullSecrets.dataSecret, pullSecrets.dataSecretIV)
+      dataOut = JSON.parse(plain) as Record<string, unknown>
+    } else {
+      dataOut = (enc as Record<string, unknown>) ?? {}
+    }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    return { ok: false, error: `停止响应解析失败: ${msg}` }
+  }
+  const succStat = Number(dataOut.SuccStat ?? 1)
+  if (succStat !== 0) {
+    const failReason = String(dataOut.FailReason ?? '')
+    return { ok: false, error: `停止失败：FailReason=${failReason || '未知'}` }
+  }
+
+  return { ok: true, text }
 }
 
 /** 模拟第三方调用对端服务平台的 query_start_charge（互联互通根地址 + outboundPlatformSecrets + Bearer，与 query_stations_info 一致） */
@@ -2413,20 +2546,9 @@ export async function postLocalQueryStartCharge(
 
   const url = `${base.replace(/\/$/, '')}/query_start_charge`
 
-  let tokenRetry = 0
-  while (tokenRetry < 2) {
-    let token: string
+  const attempt = await fetchThirdPartyJsonWithTokenRetry(link.linkUuid, async (token) => {
     try {
-      token = await ensureThirdPartyAccessTokenForLinkUuid(link.linkUuid, tokenRetry > 0)
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e)
-      return { ok: false, error: `获取 token 失败: ${msg}` }
-    }
-
-    let res: Response
-    let text: string
-    try {
-      res = await fetch(url, {
+      const res = await fetch(url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json; charset=utf-8',
@@ -2434,96 +2556,165 @@ export async function postLocalQueryStartCharge(
         },
         body: JSON.stringify(body),
       })
-      text = await res.text()
+      return { httpStatus: res.status, responseText: await res.text() }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
       const hint =
         msg.includes('fetch failed') || msg === 'Failed to fetch'
           ? `${msg}（常见原因：地址不可达、端口未开放、HTTPS 证书、或本机未启动对端服务）`
           : msg
-      pushOutboundHttpLog('query_start_charge', 'fetch 失败', url, body, dataObj, { ok: false, error: hint })
-      patchLocalOrder({
-        productState: 'start_failed',
-        protocolState: 5,
-        suspendAt: undefined,
-      })
-      return { ok: false, error: hint }
+      throw new Error(hint)
     }
+  })
 
+  const failStart = () => {
+    patchLocalOrder({
+      productState: 'start_failed',
+      protocolState: 5,
+      suspendAt: undefined,
+    })
+  }
+
+  if (!attempt.ok) {
     pushOutboundHttpLog(
       'query_start_charge',
-      String(res.status),
+      attempt.httpStatus != null ? String(attempt.httpStatus) : 'fetch 失败',
       url,
       body,
       dataObj,
-      {
-        ok: true,
-        status: res.status,
-        responseText: text,
-      },
-      { responseDecrypt: { dataSecret: pullSecrets.dataSecret, dataSecretIV: pullSecrets.dataSecretIV } },
+      { ok: false, error: attempt.error },
     )
-
-    if (!res.ok) {
-      patchLocalOrder({
-        productState: 'start_failed',
-        protocolState: 5,
-        suspendAt: undefined,
-      })
-      return { ok: false, error: `HTTP ${res.status}` }
-    }
-
-    let json: Record<string, unknown>
-    try {
-      json = JSON.parse(text) as Record<string, unknown>
-    } catch {
-      patchLocalOrder({
-        productState: 'start_failed',
-        protocolState: 5,
-        suspendAt: undefined,
-      })
-      return { ok: false, error: '响应不是合法 JSON' }
-    }
-
-    const ret = Number(json.Ret ?? -1)
-    if (ret !== 0) {
-      if (tokenRetry < 1 && isLikelyTokenBusinessFailure(ret, json)) {
-        invalidateThirdPartyToken(link.linkUuid)
-        tokenRetry += 1
-        continue
-      }
-      patchLocalOrder({
-        productState: 'start_failed',
-        protocolState: 5,
-        suspendAt: undefined,
-      })
-      return { ok: false, error: String(json.Msg ?? `Ret=${ret}`) }
-    }
-
-    const biz = parseQueryStartChargeHttpResponse(text, pullSecrets)
-    if (!biz.ok) {
-      patchLocalOrder({
-        productState: 'start_failed',
-        protocolState: 5,
-        suspendAt: undefined,
-      })
-      return biz
-    }
-    patchLocalOrder({
-      startChargeSeq: String(biz.startChargeSeq || startChargeSeq),
-      productState: 'starting',
-      protocolState: 1,
-      suspendAt: Date.now() + 120_000,
-    })
-    return { ok: true, text, startChargeSeq: biz.startChargeSeq }
+    failStart()
+    return { ok: false, error: attempt.error }
   }
 
+  pushOutboundHttpLog(
+    'query_start_charge',
+    String(attempt.httpStatus),
+    url,
+    body,
+    dataObj,
+    {
+      ok: true,
+      status: attempt.httpStatus,
+      responseText: attempt.responseText,
+    },
+    { responseDecrypt: { dataSecret: pullSecrets.dataSecret, dataSecretIV: pullSecrets.dataSecretIV } },
+  )
+
+  const text = attempt.responseText
+  if (attempt.httpStatus < 200 || attempt.httpStatus >= 300) {
+    failStart()
+    return { ok: false, error: `HTTP ${attempt.httpStatus}` }
+  }
+
+  const biz = parseQueryStartChargeHttpResponse(text, pullSecrets)
+  if (!biz.ok) {
+    failStart()
+    return biz
+  }
   patchLocalOrder({
-    productState: 'start_failed',
-    protocolState: 5,
-    suspendAt: undefined,
+    startChargeSeq: String(biz.startChargeSeq || startChargeSeq),
+    productState: 'starting',
+    protocolState: 1,
+    suspendAt: Date.now() + 120_000,
   })
-  return { ok: false, error: 'query_start_charge 未返回有效结果' }
+  return { ok: true, text, startChargeSeq: biz.startChargeSeq }
+}
+
+/** 模拟第三方调用对端服务平台的 query_terminal_code（token + 加解密签名与 query_stations_info 一致） */
+export async function postLocalQueryTerminalCode(
+  link: CecLinkConfig,
+  qrCode: string,
+  opts?: { longitude?: number; latitude?: number },
+): Promise<{ ok: true; connectorId: string; linkUuid: string } | { ok: false; error: string }> {
+  const base = thirdPartyOutboundBase(link.thirdParty)
+  if (!base || !/^https?:\/\//i.test(base)) {
+    return {
+      ok: false,
+      error: '第三方互联互通地址无效，请填写以 http:// 或 https:// 开头的根地址',
+    }
+  }
+  const pullSecrets = outboundPlatformSecrets(link)
+  if (!String(pullSecrets.operatorId ?? '').trim()) {
+    return {
+      ok: false,
+      error: '平台编码（OperatorID）为空，无法签名 query_terminal_code；请完善本地或三方配置',
+    }
+  }
+  const qr = String(qrCode ?? '').trim()
+  if (!qr) return { ok: false, error: 'QRCode 为空' }
+
+  const dataObj: Record<string, unknown> = { QRCode: qr }
+  if (opts?.longitude != null && Number.isFinite(opts.longitude)) {
+    dataObj.Longitude = opts.longitude
+  }
+  if (opts?.latitude != null && Number.isFinite(opts.latitude)) {
+    dataObj.Latitude = opts.latitude
+  }
+  const ts = formatTs(new Date())
+  const seq = '0001'
+  const dataStr = encryptDataJson(JSON.stringify(dataObj), pullSecrets.dataSecret, pullSecrets.dataSecretIV)
+  const body = {
+    OperatorID: pullSecrets.operatorId,
+    TimeStamp: ts,
+    Seq: seq,
+    Sig: signEnvelope(pullSecrets.operatorId, dataStr, ts, seq, pullSecrets.sigSecret),
+    Data: dataStr,
+  }
+
+  const url = `${base.replace(/\/$/, '')}/query_terminal_code`
+
+  const attempt = await fetchThirdPartyJsonWithTokenRetry(link.linkUuid, async (token) => {
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json; charset=utf-8',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify(body),
+      })
+      return { httpStatus: res.status, responseText: await res.text() }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      const hint =
+        msg.includes('fetch failed') || msg === 'Failed to fetch'
+          ? `${msg}（常见原因：地址不可达、端口未开放、HTTPS 证书、或本机未启动对端服务）`
+          : msg
+      throw new Error(hint)
+    }
+  })
+
+  if (!attempt.ok) {
+    pushOutboundHttpLog(
+      'query_terminal_code',
+      attempt.httpStatus != null ? String(attempt.httpStatus) : 'fetch 失败',
+      url,
+      body,
+      dataObj,
+      { ok: false, error: attempt.error },
+    )
+    return { ok: false, error: attempt.error }
+  }
+
+  pushOutboundHttpLog(
+    'query_terminal_code',
+    String(attempt.httpStatus),
+    url,
+    body,
+    dataObj,
+    { ok: true, status: attempt.httpStatus, responseText: attempt.responseText },
+    { responseDecrypt: { dataSecret: pullSecrets.dataSecret, dataSecretIV: pullSecrets.dataSecretIV } },
+  )
+
+  if (attempt.httpStatus < 200 || attempt.httpStatus >= 300) {
+    return { ok: false, error: `HTTP ${attempt.httpStatus}` }
+  }
+
+  const biz = parseQueryTerminalCodeHttpResponse(attempt.responseText, pullSecrets)
+  if (!biz.ok) return biz
+  return { ok: true, connectorId: biz.connectorId, linkUuid: link.linkUuid }
 }
 
 async function pullOrderChargeStatusFromThirdParty(order: CecOrderRecord): Promise<void> {
@@ -2537,8 +2728,6 @@ async function pullOrderChargeStatusFromThirdParty(order: CecOrderRecord): Promi
   const url = `${base.replace(/\/$/, '')}/query_equip_charge_status`
   const dataObj: Record<string, unknown> = {
     StartChargeSeq: order.startChargeSeq,
-    StartChargeSeqStat: order.protocolState,
-    ConnectorID: order.connectorId,
   }
   const ts = formatTs(new Date())
   const seq = '0001'
@@ -2551,18 +2740,9 @@ async function pullOrderChargeStatusFromThirdParty(order: CecOrderRecord): Promi
     Data: dataStr,
   }
 
-  let tokenRetry = 0
-  while (tokenRetry < 2) {
-    let token: string
+  const attempt = await fetchThirdPartyJsonWithTokenRetry(order.linkUuid, async (token) => {
     try {
-      token = await ensureThirdPartyAccessTokenForLinkUuid(link.linkUuid, tokenRetry > 0)
-    } catch {
-      return
-    }
-    let res: Response
-    let text: string
-    try {
-      res = await fetch(url, {
+      const res = await fetch(url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json; charset=utf-8',
@@ -2570,59 +2750,46 @@ async function pullOrderChargeStatusFromThirdParty(order: CecOrderRecord): Promi
         },
         body: JSON.stringify(body),
       })
-      text = await res.text()
+      return { httpStatus: res.status, responseText: await res.text() }
     } catch {
-      return
+      throw new Error('fetch failed')
     }
-    pushOutboundHttpLog(
-      'query_equip_charge_status',
-      String(res.status),
-      url,
-      body,
-      dataObj,
-      { ok: true, status: res.status, responseText: text },
-      { responseDecrypt: { dataSecret: pullSecrets.dataSecret, dataSecretIV: pullSecrets.dataSecretIV } },
-    )
-    let json: Record<string, unknown>
-    try {
-      json = JSON.parse(text) as Record<string, unknown>
-    } catch {
-      return
-    }
-    const ret = Number(json.Ret ?? -1)
-    if (ret !== 0) {
-      if (tokenRetry < 1 && isLikelyTokenBusinessFailure(ret, json)) {
-        invalidateThirdPartyToken(link.linkUuid)
-        tokenRetry += 1
-        continue
-      }
-      return
-    }
+  })
 
-    let dataOut: Record<string, unknown>
-    try {
-      const enc = json.Data
-      if (typeof enc === 'string') {
-        const plain = decryptDataBase64(enc, pullSecrets.dataSecret, pullSecrets.dataSecretIV)
-        dataOut = JSON.parse(plain) as Record<string, unknown>
-      } else {
-        dataOut = (enc as Record<string, unknown>) ?? {}
-      }
-    } catch {
-      return
-    }
-    const succStat = Number(dataOut.SuccStat ?? 1)
-    if (succStat !== 0) return
+  if (!attempt.ok) return
 
-    const now = Date.now()
-    const snap = getCecSnapshot()
-    const orders = snap.orders.map((o) => {
-      if (o.id !== order.id) return o
-      return applyChargeStatusToOrder(o, dataOut, now)
-    })
-    setCecSnapshot({ ...snap, orders })
+  pushOutboundHttpLog(
+    'query_equip_charge_status',
+    String(attempt.httpStatus),
+    url,
+    body,
+    dataObj,
+    { ok: true, status: attempt.httpStatus, responseText: attempt.responseText },
+    { responseDecrypt: { dataSecret: pullSecrets.dataSecret, dataSecretIV: pullSecrets.dataSecretIV } },
+  )
+
+  const json = attempt.json
+  let dataOut: Record<string, unknown>
+  try {
+    const enc = json.Data
+    if (typeof enc === 'string') {
+      const plain = decryptDataBase64(enc, pullSecrets.dataSecret, pullSecrets.dataSecretIV)
+      dataOut = JSON.parse(plain) as Record<string, unknown>
+    } else {
+      dataOut = (enc as Record<string, unknown>) ?? {}
+    }
+  } catch {
     return
   }
+  if (!isQueryChargeStatusResponseUsable(dataOut)) return
+
+  const now = Date.now()
+  const snap = getCecSnapshot()
+  const orders = snap.orders.map((o) => {
+    if (o.id !== order.id) return o
+    return applyChargeStatusToOrder(o, dataOut, now)
+  })
+  setCecSnapshot({ ...snap, orders })
 }
 
 /** 订单挂起巡检 */
@@ -2646,9 +2813,10 @@ export async function syncOrderChargeStatusById(
   if (!id) return { ok: false, error: 'order id 为空' }
   const order = getCecSnapshot().orders.find((o) => o.id === id)
   if (!order) return { ok: false, error: '订单不存在' }
-  if (isOrderFinishedByProtocolState(order)) {
-    return { ok: false, error: '订单已结束，无需同步' }
-  }
   await pullOrderChargeStatusFromThirdParty(order)
+  const updated = getCecSnapshot().orders.find((o) => o.id === id)
+  if (!updated || updated.updatedAt <= order.updatedAt) {
+    return { ok: false, error: '未收到有效充电状态响应，订单未更新' }
+  }
   return { ok: true }
 }
