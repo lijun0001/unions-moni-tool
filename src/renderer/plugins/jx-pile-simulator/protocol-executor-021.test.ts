@@ -75,6 +75,49 @@ describe('0x21 表-3.9.7', () => {
     expect(d.bcpSoc).toBeCloseTo(88, 5)
   })
 
+  it('直流 0x21：BRM-VIN 优先取订单 request23.vin（VIN/扫码VIN 鉴权）', () => {
+    const p = pileBase({
+      deviceKind: 'dc',
+      guns: [{ gunId: 'A', status: 'linked', vin: undefined, soc: 50 }],
+    })
+    const o = orderBase({
+      startAuthSource: '0x40-vin',
+      request23: {
+        vin: 'LFPH3A1A0R1234567',
+        userType: 6,
+        userId: 'LFPH3A1A0R1234567',
+        controlMode: 4,
+        controlParam: 0,
+        chargeMode: 1,
+      },
+    })
+    const hex = make21Payload(p, o, '00', 1, 0)
+    const d = decodeCmdPayload('0x21', hex, p.protocolId) as Record<string, unknown>
+    expect(String(d.brmVin ?? '').trim()).toBe('LFPH3A1A0R1234567')
+    expect(String(d.userId ?? '').trim()).toBe('LFPH3A1A0R1234567')
+    expect(d.userType).toBe(6)
+  })
+
+  it('直流 0x21：扫码VIN 订单无枪 VIN 时仍写入 BRM-VIN', () => {
+    const p = pileBase({
+      deviceKind: 'dc',
+      guns: [{ gunId: 'A', status: 'linked', lastVin: 'WVWZZZ3CZWE123456', soc: 40 }],
+    })
+    const o = orderBase({
+      startAuthSource: '0x59-scan-vin',
+      request23: {
+        userType: 6,
+        userId: 'WVWZZZ3CZWE123456',
+        controlMode: 4,
+        controlParam: 0,
+        chargeMode: 1,
+      },
+    })
+    const hex = make21Payload(p, o, '00', 1, 0)
+    const d = decodeCmdPayload('0x21', hex, p.protocolId) as Record<string, unknown>
+    expect(String(d.brmVin ?? '').trim()).toBe('WVWZZZ3CZWE123456')
+  })
+
   it('V2.24：充电起始电量按 0.0001kWh 编解码', () => {
     const p = pileBase({ protocolId: 'jx-v2.24-core', deviceKind: 'ac' })
     const o = orderBase()

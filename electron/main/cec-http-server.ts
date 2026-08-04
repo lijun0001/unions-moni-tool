@@ -44,6 +44,88 @@ function pushLog(partial: Omit<CecLogEntry, 'id'>): void {
   notifyRenderer(entry)
 }
 
+const CEC_LOG_BODY_MAX_LEN = 16_000
+
+function truncateCecLogString(s: string, max: number): string {
+  if (s.length <= max) return s
+  return `${s.slice(0, max)}…(截断，原长 ${s.length})`
+}
+
+/** 压缩日志中的大字段，避免整条 JSON 被截断后前端无法解析、明文/密文切换失效 */
+function shrinkCecLogValue(value: unknown, maxJsonChars: number): unknown {
+  if (value == null) return value
+  if (typeof value === 'string') return truncateCecLogString(value, maxJsonChars)
+  if (typeof value !== 'object') return value
+
+  const json = JSON.stringify(value)
+  if (json.length <= maxJsonChars) return value
+
+  if (!Array.isArray(value)) {
+    const obj = { ...(value as Record<string, unknown>) }
+    for (const key of ['StationInfos', 'stationInfos', 'ChargeDetails', 'chargeDetails']) {
+      const arr = obj[key]
+      if (!Array.isArray(arr) || arr.length <= 1) continue
+      obj[key] = arr.slice(0, 1)
+      obj[`_${key}LogNote`] = `日志仅保留 1 条预览，共 ${arr.length} 条`
+      if (JSON.stringify(obj).length <= maxJsonChars) return obj
+    }
+  }
+
+  return {
+    _truncated: true,
+    preview: truncateCecLogString(json, Math.max(200, maxJsonChars - 80)),
+  }
+}
+
+export function serializeCecLogBody(structured: Record<string, unknown>): string {
+  const shrinkKeys = [
+    'requestEnvelopeCipher',
+    'paramsDataCipher',
+    'responseCipher',
+    'responsePlain',
+    'requestCipher',
+    'requestPlain',
+    'response',
+  ] as const
+
+  const shrinkPass = (fieldMax: number): Record<string, unknown> => {
+    const out = { ...structured }
+    for (const k of shrinkKeys) {
+      if (k in out && out[k] != null) {
+        out[k] = shrinkCecLogValue(out[k], fieldMax)
+      }
+    }
+    return out
+  }
+
+  for (const fieldMax of [5000, 2500, 1200]) {
+    const json = JSON.stringify(shrinkPass(fieldMax))
+    if (json.length <= CEC_LOG_BODY_MAX_LEN) return json
+  }
+
+  const fallback = shrinkPass(800)
+  fallback.responsePlain = { _omitted: '响应明文过大，请切换密文查看 responseCipher' }
+  if (typeof fallback.responseCipher === 'string') {
+    fallback.responseCipher = truncateCecLogString(fallback.responseCipher, 7000)
+  }
+  const json = JSON.stringify(fallback)
+  if (json.length <= CEC_LOG_BODY_MAX_LEN) return json
+
+  return JSON.stringify({
+    kind: structured.kind,
+    action: structured.action ?? structured.name,
+    requestUrl: structured.requestUrl,
+    _bodyCompressed: true,
+    paramsPlain: shrinkCecLogValue(structured.paramsPlain ?? structured.requestPlain, 1500),
+    requestEnvelopeCipher: truncateCecLogString(
+      String(structured.requestEnvelopeCipher ?? structured.requestCipher ?? ''),
+      2500,
+    ),
+    responsePlain: { _omitted: true },
+    responseCipher: truncateCecLogString(String(structured.responseCipher ?? ''), 2500),
+  })
+}
+
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = []
@@ -411,8 +493,10 @@ function buildInboundRejectLogBody(params: {
     params: params.parsed.dataObj,
     response: params.response,
     requestEnvelopeCipher: params.rawBody,
+    responseCipher: params.response,
+    responsePlain: null,
   }
-  return JSON.stringify(structured).slice(0, 16000)
+  return serializeCecLogBody(structured)
 }
 
 /**
@@ -445,7 +529,7 @@ function buildInboundCallLogBody(
     responsePlain: responsePlain ?? null,
     responseCipher: responseEnvelope ?? null,
   }
-  return JSON.stringify(structured).slice(0, 16000)
+  return serializeCecLogBody(structured)
 }
 
 /** 受支持的互联互通接口名（路径结构固定为 /api/{linkUuid}/{action}） */
@@ -466,6 +550,19 @@ const CEC_ROOT_POST_ACTIONS = new Set([
   'notification_start_charge_result',
   'notification_charge_order_info',
   'notification_stop_charge_result',
+])
+
+/**
+ * 服务平台主动推送至第三方的接口：入站仅验签解密，不要求对端先调用本平台 query_token 取得 Bearer。
+ * （第三方调用服务平台的 query_* 仍须携带本平台签发的 token。）
+ */
+const CEC_PLATFORM_PUSH_INBOUND_ACTIONS = new Set([
+  'notification_status',
+  'notification_station_status',
+  'notification_start_charge_result',
+  'notification_equip_charge_status',
+  'notification_stop_charge_result',
+  'notification_charge_order_info',
 ])
 
 function endpointExistsInProtocol(link: CecLinkConfig, action: string): boolean {
@@ -1089,7 +1186,7 @@ export async function dispatchCecRequest(
     return { status: 403, body: { Ret: 4001, Msg: '签名错误', Sig: '', Data: {} } }
   }
   const parsed = inbound.parsed
-  if (actionKey !== 'query_token') {
+  if (actionKey !== 'query_token' && !CEC_PLATFORM_PUSH_INBOUND_ACTIONS.has(actionKey)) {
     const auth = validateInboundAuthToken(linkUuid, bearerToken)
     if (!auth.ok) {
       const rejectMsg = inboundAuthRejectMsg(auth.reason)
@@ -1653,7 +1750,7 @@ function pushOutboundHttpLog(
     direction: 'outbound',
     name,
     summary,
-    body: JSON.stringify(structured).slice(0, 16000),
+    body: serializeCecLogBody(structured),
   })
 }
 

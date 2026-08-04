@@ -428,7 +428,13 @@ function isLogCipherMode(logId: string): boolean {
 function logShowsPlainCipherToggle(log: CecLogEntry): boolean {
   try {
     const o = JSON.parse(log.body) as Record<string, unknown>
-    if (o.kind === 'cec_inbound_http' || o.kind === 'cec_outbound_http') return true
+    if (
+      o.kind === 'cec_inbound_http' ||
+      o.kind === 'cec_outbound_http' ||
+      o.kind === 'cec_inbound_reject'
+    ) {
+      return true
+    }
     if (o.params != null && typeof o.raw === 'string') return true
   } catch {
     return false
@@ -816,6 +822,16 @@ function formatLogBodySingleLine(log: CecLogEntry): string {
         : toSingleLineText(JSON.stringify(o.responsePlain ?? {}))
       return toSingleLineText(`url=${url} params=${req} resp=${resp}`)
     }
+    if (o.kind === 'cec_inbound_reject') {
+      const url = String(o.requestUrl ?? '')
+      const req = cipher
+        ? toSingleLineText(String(o.requestEnvelopeCipher ?? ''))
+        : toSingleLineText(JSON.stringify(o.paramsPlain ?? o.params ?? {}))
+      const resp = cipher
+        ? toSingleLineText(JSON.stringify(o.responseCipher ?? o.response ?? {}))
+        : toSingleLineText(JSON.stringify(o.responsePlain ?? {}))
+      return toSingleLineText(`url=${url} params=${req} resp=${resp}`)
+    }
     if (o.kind === 'cec_outbound_http') {
       const url = String(o.requestUrl ?? '')
       const req = cipher
@@ -874,6 +890,20 @@ function formatLogExpanded(log: CecLogEntry): string {
       ? prettyLogJson(o.responseCipher ?? '')
       : prettyLogJson(o.responsePlain ?? o.response)
     return `时间：${ts}\n${modeLine}\n请求url：${requestUrl || '(空)'}\n请求参数：\n${req}\n返回值：\n${resp}`
+  }
+
+  if (o.kind === 'cec_inbound_reject') {
+    const requestUrl = String(o.requestUrl ?? '')
+    const reason = String(o.reason ?? '')
+    const modeLine = `展示：${cipher ? '密文（HTTP 原文 / 响应信封）' : '明文（加密前请求体 / 解密后响应体）'}`
+    const req = cipher
+      ? prettyLogJson(o.requestEnvelopeCipher ?? '')
+      : prettyLogJson(o.paramsPlain ?? o.params)
+    const resp = cipher
+      ? prettyLogJson(o.responseCipher ?? o.response)
+      : prettyLogJson(o.responsePlain ?? {})
+    const reasonLine = reason ? `拒绝原因：${reason}\n` : ''
+    return `时间：${ts}\n${modeLine}\n${reasonLine}请求url：${requestUrl || '(空)'}\n请求参数：\n${req}\n返回值：\n${resp}`
   }
 
   if (o.kind === 'cec_outbound_http') {

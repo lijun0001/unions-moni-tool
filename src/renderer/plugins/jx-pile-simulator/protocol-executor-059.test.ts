@@ -41,7 +41,7 @@ describe('parseVinStart59Payload / buildVinStart5bPayload', () => {
 })
 
 describe('active listen flow routing', () => {
-  it('only scan-qr-vin-start enables 0x59 handler', () => {
+  it('isScanQrVinListenFlow identifies scan-qr-vin-start panel only', () => {
     expect(isScanQrVinListenFlow('scan-qr-vin-start')).toBe(true)
     expect(isScanQrVinListenFlow('scan-qr-remote-start')).toBe(false)
     expect(isScanQrVinListenFlow('remote-start')).toBe(false)

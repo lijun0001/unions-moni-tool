@@ -6,7 +6,12 @@ import electron from 'vite-plugin-electron/simple'
 import pkg from './package.json'
 import { createObfuscatePlugin } from './vite/plugins/obfuscate'
 import { normalizeExperienceValid } from './src/shared/experience-validity'
+import { ensureDevElectronName } from './scripts/ensure-dev-electron-name.mjs'
+
 const root = path.resolve(__dirname)
+
+/** Windows 开发启动与本机安装版同名，避免安全助手按 electron.exe 拦截 */
+ensureDevElectronName()
 
 export default defineConfig(({ command }) => {
   fs.rmSync('dist-electron', { recursive: true, force: true })

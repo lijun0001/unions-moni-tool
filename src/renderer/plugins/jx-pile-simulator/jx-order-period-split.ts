@@ -76,7 +76,8 @@ function formatDisplayTime(ms: number): string {
 }
 
 function roundMoney(y: number): number {
-  return Math.round(y * WIRE_SCALE.TWO_POINT) / WIRE_SCALE.TWO_POINT
+  /** 内部模拟电费/服务费保留 4 位小数；上送报文时再按 TWO_POINT（0.01 元）取整 */
+  return Math.round(y * WIRE_SCALE.FOUR_POINT) / WIRE_SCALE.FOUR_POINT
 }
 
 function roundEnergy(kwh: number): number {

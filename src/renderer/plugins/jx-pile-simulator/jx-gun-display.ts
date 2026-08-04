@@ -31,8 +31,18 @@ export function gunHudCharging(gun: { status: string }): boolean {
   return gun.status === 'charging'
 }
 
-export function gunHudShowsLiveCharging(pile: { status: string }, gun: { status: string }): boolean {
-  return pile.status === 'charging' && gun.status === 'charging'
+/** 实时 HUD 仅看枪状态：双枪同时充时停一枪不应影响另一枪展示 */
+export function gunHudShowsLiveCharging(_pile: { status: string }, gun: { status: string }): boolean {
+  return gun.status === 'charging'
+}
+
+/** 某枪结束充电后，桩级 status：仍有其它枪在充则保持 charging */
+export function pileStatusAfterGunLeaveCharging(
+  guns: Array<{ gunId: string; status: string }>,
+  stoppedGunId: string,
+): 'idle' | 'charging' {
+  const othersCharging = guns.some((g) => g.gunId !== stoppedGunId && g.status === 'charging')
+  return othersCharging ? 'charging' : 'idle'
 }
 
 export function gunHudSocDisplay(
@@ -71,7 +81,7 @@ export function gunHudAmountLine(
   if (!gunHudShowsLiveCharging(pile, gun)) return '-'
   const o = orders.find((x) => x.gunId === gunId && x.status === 'charging')
   const y = o?.latest25?.chargeAmountYuan
-  if (typeof y === 'number' && Number.isFinite(y)) return `${y.toFixed(2)}元`
+  if (typeof y === 'number' && Number.isFinite(y)) return `${y.toFixed(4)}元`
   return '-'
 }
 

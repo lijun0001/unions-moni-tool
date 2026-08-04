@@ -5,6 +5,7 @@
  * 其它命令若需同一套 V2.24/V2.25 分支，请从 `jx-protocol-profile.ts` 复用 `order23WireProfileFromProtocolId`。
  */
 import type { JxPileOrder, JxTopologyPile } from './types'
+import { WIRE_SCALE } from './jx-wire-scale'
 
 const DEFAULT_TARIFF_MODEL_VERSION = 1
 
@@ -150,6 +151,12 @@ function resolveOrder23WireSegments(order: JxPileOrder): Array<{ modelIndex: num
     .map((x) => ({ modelIndex: x.modelIndex, energyKwh: x.energyKwh }))
 }
 
+function order23BatterySnHex(pushCmd: '0x23' | '0x33', byteLen: number): string {
+  // 0x23 最新充电记录：电池 SN 全 0 表示无电池数据；0x33 历史记录仍用占位 SN
+  if (pushCmd === '0x23') return asciiFixedHex('', byteLen)
+  return asciiFixedHex('HISTORY-SN', byteLen)
+}
+
 /** 上行推送：按桩协议拼接 `0x23`/`0x33` 数据域（不含帧头） */
 export function encodeOrder23Or33Payload(
   order: JxPileOrder,
@@ -196,8 +203,8 @@ export function encodeOrder23Or33Payload(
       order.request23?.tariffModelVersionAtStart ??
       DEFAULT_TARIFF_MODEL_VERSION,
   )
-  const eleFee = u32LeHex(Math.round((order.latest25?.electricFeeYuan ?? 0) * 100))
-  const svcFee = u32LeHex(Math.round((order.latest25?.serviceFeeYuan ?? 0) * 100))
+  const eleFee = u32LeHex(Math.round((order.latest25?.electricFeeYuan ?? 0) * WIRE_SCALE.TWO_POINT))
+  const svcFee = u32LeHex(Math.round((order.latest25?.serviceFeeYuan ?? 0) * WIRE_SCALE.TWO_POINT))
   const parkFee = u32LeHex(0)
   const segmentsWithEnergy = resolveOrder23WireSegments(order)
   const segCountNum = Math.min(20, Math.max(1, segmentsWithEnergy.length))
@@ -220,11 +227,11 @@ export function encodeOrder23Or33Payload(
             )
             .join('')
         : `00${u32LeHex(Math.max(0, Math.round(energyEndKwh * 10000)))}`
-    const batterySn = asciiFixedHex(pushCmd === '0x33' ? 'HISTORY-SN' : 'LATEST-SN', 27)
+    const batterySn = order23BatterySnHex(pushCmd, 27)
     return `${makeTimeTag6Hex()}${gunNoHex}${recordIndex}${orderNo}${userId}${userType}${orgCode}${cardBal}${vin}${begin}${end}${beginEnergy}${endEnergy}${beginSoc}${endSoc}${controlMode}${controlParam}${startMode}${scheduleWire}${chargeMode}${stopReason}${modelSelect}${modelVersion}${eleFee}${svcFee}${parkFee}${segCount}${segmentHex}${batterySn}`
   }
 
-  const batterySn = asciiFixedHex(pushCmd === '0x33' ? 'HISTORY-SN' : 'LATEST-SN', 17)
+  const batterySn = order23BatterySnHex(pushCmd, 17)
   const beginEnergy = encodeU40Le(0)
   const endEnergy = encodeU40Le(Math.max(0, Math.round(energyEndKwh * 10000)))
   const segmentHex =

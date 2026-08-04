@@ -9,6 +9,7 @@ import {
   isVirtualCarForPile,
   pileChargingGunCount,
 } from './jx-gun-display'
+import { pileDisplayLabel, pileHasCustomName } from './jx-pile-display'
 import { useJxOrderStore } from './useJxOrderStore'
 import JxRatePopover from './JxRatePopover.vue'
 
@@ -174,7 +175,10 @@ function gunStatusDotClass(pile: JxTopologyPile, gunId: string): string {
         <span class="jx-list-card-badge">{{ pile.guns.length }}枪</span>
         <img class="jx-list-card-icon" :src="chargePileSvg" alt="" aria-hidden="true" />
         <div class="jx-list-card-body">
-          <div class="jx-list-card-id">{{ pile.pileId }}</div>
+          <div class="jx-list-card-name" :class="{ 'is-default': !pileHasCustomName(pile) }">
+            {{ pileDisplayLabel(pile) }}
+          </div>
+          <div class="jx-list-card-id is-sub">{{ pile.pileId }}</div>
           <div class="jx-list-card-meta">
             <span class="jx-list-card-dot" :class="statusDotClass(pile.onlineState)" />
             <span>{{ linkStateLabel(pile.onlineState) }}</span>
@@ -196,7 +200,10 @@ function gunStatusDotClass(pile: JxTopologyPile, gunId: string): string {
       <template v-else>
         <header class="jx-list-detail-head">
           <h2 class="jx-list-detail-title">
-            <span class="jx-list-detail-pile-id">{{ activePile.pileId }}</span>
+            <span class="jx-list-detail-pile-name" :class="{ 'is-default': !pileHasCustomName(activePile) }">
+              {{ pileDisplayLabel(activePile) }}
+            </span>
+            <span class="jx-list-detail-pile-id is-sub">{{ activePile.pileId }}</span>
             <span class="jx-list-detail-title-suffix">详情</span>
           </h2>
           <el-dropdown trigger="contextmenu" @command="onDetailLinkCommand">
@@ -236,6 +243,10 @@ function gunStatusDotClass(pile: JxTopologyPile, gunId: string): string {
             <img class="jx-list-pile-art" :src="chargePileSvg" alt="充电桩" />
           </div>
           <dl class="jx-list-pile-kv">
+            <div class="jx-list-kv-row">
+              <dt>桩名称</dt>
+              <dd>{{ pileDisplayLabel(activePile) }}</dd>
+            </div>
             <div class="jx-list-kv-row">
               <dt>桩体编号</dt>
               <dd>{{ activePile.pileId }}</dd>
@@ -431,7 +442,23 @@ function gunStatusDotClass(pile: JxTopologyPile, gunId: string): string {
 }
 
 .jx-list-card-body { min-width: 0; flex: 1; padding-right: 28px; }
+.jx-list-card-name {
+  font-size: 12px;
+  font-weight: 700;
+  word-break: break-all;
+  line-height: 1.3;
+  color: var(--jx-text);
+}
+.jx-list-card-name.is-default {
+  color: var(--jx-muted);
+}
 .jx-list-card-id { font-size: 12px; font-weight: 700; word-break: break-all; line-height: 1.3; }
+.jx-list-card-id.is-sub {
+  margin-top: 2px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--jx-pile-id, var(--jx-muted));
+}
 .jx-list-card-meta {
   margin-top: 6px;
   display: flex;
@@ -513,10 +540,18 @@ function gunStatusDotClass(pile: JxTopologyPile, gunId: string): string {
   font-weight: 700;
   display: flex;
   align-items: baseline;
+  flex-wrap: wrap;
   gap: 6px;
 }
 
+.jx-list-detail-pile-name { color: var(--jx-text); }
+.jx-list-detail-pile-name.is-default { color: var(--jx-muted); }
 .jx-list-detail-pile-id { color: var(--jx-pile-id); }
+.jx-list-detail-pile-id.is-sub {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--jx-muted);
+}
 .jx-list-detail-title-suffix { color: var(--jx-text); font-weight: 600; }
 
 .jx-list-link-btn {

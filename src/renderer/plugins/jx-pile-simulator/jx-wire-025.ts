@@ -105,7 +105,8 @@ function gunIdToGunNoHex(pile: JxTopologyPile, gunId: string): string {
 
 /**
  * `CM25Data222` 固定前缀 + `count`×32 字节段（与反射字段顺序一致）。
- * 线整数：`elect`/段电量 → FOUR_POINT kWh；金额类 → TWO_POINT 元；电压电流 → ONE_POINT。
+ * 线整数：`elect`/段电量/电价单价 → FOUR_POINT；充电金额/电费/服务费/段费用 → TWO_POINT 元；
+ * 账户余额 → TWO_POINT 元；电压电流 → ONE_POINT。
  */
 export function encodeCm25Data222Layout(ctx: {
   gunNoHex: string
@@ -222,9 +223,9 @@ export function build025PayloadWire(
 
   const mergedSegments = mergeChargingPeriodEnergySegments(order.periodEnergySegments ?? [], freshSplit)
 
-  const electricFeeYuan = mergedSegments.reduce((s, x) => s + x.electricFeeYuan, 0)
-  const serviceFeeYuan = mergedSegments.reduce((s, x) => s + x.serviceFeeYuan, 0)
-  const amountYuan = Math.max(0.01, electricFeeYuan + serviceFeeYuan)
+  const electricFeeYuan = roundMoney(mergedSegments.reduce((s, x) => s + x.electricFeeYuan, 0))
+  const serviceFeeYuan = roundMoney(mergedSegments.reduce((s, x) => s + x.serviceFeeYuan, 0))
+  const amountYuan = Math.max(0.0001, roundMoney(electricFeeYuan + serviceFeeYuan))
 
   const targetAmountYuan =
     order.request23?.controlMode === 3 ? Math.max(0, (order.request23?.controlParam ?? 0) * 0.01) : 0
@@ -287,5 +288,6 @@ export function build025PayloadWire(
 }
 
 function roundMoney(y: number): number {
-  return Math.round(y * WIRE_SCALE.TWO_POINT) / WIRE_SCALE.TWO_POINT
+  /** 内部模拟电费/服务费保留 4 位小数；上送报文时再按 TWO_POINT（0.01 元）取整 */
+  return Math.round(y * WIRE_SCALE.FOUR_POINT) / WIRE_SCALE.FOUR_POINT
 }

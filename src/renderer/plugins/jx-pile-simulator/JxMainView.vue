@@ -36,6 +36,7 @@ import {
   pileColumnWidth,
   splitPilesIntoRowsByWidth,
 } from './jx-topology-layout'
+import { JX_PILE_NAME_MAX_LEN, pileDisplayLabel, pileHasCustomName, validatePileName } from './jx-pile-display'
 
 const protocolStore = useJxProtocolStore()
 const topologyStore = useJxTopologyStore()
@@ -111,6 +112,7 @@ const filterProtocol = ref('')
 const filterDeviceType = ref('')
 const addDialogVisible = ref(false)
 const addForm = ref({
+  name: '',
   pileId: '',
   tcpHost: '127.0.0.1',
   tcpPort: 9001,
@@ -129,6 +131,7 @@ const vinForm = ref({
   vin: '',
 })
 const basicForm = ref({
+  name: '',
   pileId: '',
   tcpHost: '127.0.0.1',
   tcpPort: 9000,
@@ -299,15 +302,20 @@ type BoardViewMode = 'topology' | 'list'
 const boardViewMode = ref<BoardViewMode>('topology')
 
 function setBoardViewMode(mode: BoardViewMode) {
+  if (boardViewMode.value === mode) return
+  closeVinEditor()
+  basicEditing.value = false
   if (mode === 'topology' && boardViewMode.value === 'list') {
     topologyStore.activePileId = null
   }
   boardViewMode.value = mode
-  if (mode === 'topology') {
-    nextTick(() => bindTopologyResizeObserver())
-  } else {
-    unbindTopologyResizeObserver()
-  }
+  nextTick(() => {
+    if (mode === 'topology') {
+      bindTopologyResizeObserver()
+    } else {
+      unbindTopologyResizeObserver()
+    }
+  })
 }
 
 const VIN_POP_WIDTH = 230
@@ -555,6 +563,7 @@ watch(
     loginConfig.value.allowTimeoutCount = pile.allowTimeoutCount
     loginConfig.value.heartbeatIntervalSec = pile.heartbeatIntervalSec
     basicForm.value = {
+      name: pile.name ?? '',
       pileId: pile.pileId,
       tcpHost: pile.tcpHost ?? '127.0.0.1',
       tcpPort: pile.tcpPort ?? 9000,
@@ -638,6 +647,11 @@ function saveBasicInfo() {
     return
   }
   const data = basicForm.value
+  const nameErr = validatePileName(data.name)
+  if (nameErr) {
+    ElMessage.warning(nameErr)
+    return
+  }
   if (!data.pileId.trim()) {
     ElMessage.warning('请输入桩号')
     return
@@ -660,6 +674,7 @@ function saveBasicInfo() {
   }
   try {
     topologyStore.updatePileBasic(activePile.pileId, {
+      name: data.name.trim(),
       pileId: data.pileId.trim(),
       tcpHost: data.tcpHost.trim(),
       tcpPort: data.tcpPort,
@@ -682,6 +697,7 @@ function toggleBasicEdit() {
       return
     }
     basicForm.value = {
+      name: activePile.name ?? '',
       pileId: activePile.pileId,
       tcpHost: activePile.tcpHost ?? '127.0.0.1',
       tcpPort: activePile.tcpPort ?? 9000,
@@ -917,9 +933,9 @@ function gunHudCharging(gun: { status: string }): boolean {
   return gun.status === 'charging'
 }
 
-/** 仅充电中展示实时 SOC/电量/金额；桩或枪结束充电后 HUD 归零 */
-function gunHudShowsLiveCharging(pile: { status: string }, gun: { status: string }): boolean {
-  return pile.status === 'charging' && gun.status === 'charging'
+/** 仅充电中展示实时 SOC/电量/金额；按枪判断，避免双枪同时充时停一枪牵连另一枪 */
+function gunHudShowsLiveCharging(_pile: { status: string }, gun: { status: string }): boolean {
+  return gun.status === 'charging'
 }
 
 /** 充电过程优先用订单 `latestBms.soc`，与拓扑同步 */
@@ -950,7 +966,7 @@ function gunHudAmountLine(pile: { status: string; pileId: string }, gunId: strin
   if (!gunHudShowsLiveCharging(pile, gun)) return '-'
   const o = orderStore.listByPile(pile.pileId).find((x) => x.gunId === gunId && x.status === 'charging')
   const y = o?.latest25?.chargeAmountYuan
-  if (typeof y === 'number' && Number.isFinite(y)) return `${y.toFixed(2)}元`
+  if (typeof y === 'number' && Number.isFinite(y)) return `${y.toFixed(4)}元`
   return '-'
 }
 
@@ -1309,6 +1325,7 @@ function orderStartTypeLabel(type: string): string {
   return type === 'scheduled' ? '定时启动' : '立即启动'
 }
 
+/** 0x23/0x33 电能/服务费/停车费：线整数分辨率 0.01 元（与平台 CovertConst.TWO_POINT 一致） */
 function amountFenLabel(v?: number): string {
   if (typeof v !== 'number' || Number.isNaN(v)) return '-'
   return (v / 100).toFixed(2)
@@ -1370,7 +1387,7 @@ async function renderOrderCharts() {
               continue
             }
             if (name.includes('电量')) lines.push(`${name}: ${v.toFixed(4)}`)
-            else if (name.includes('金额')) lines.push(`${name}: ${v.toFixed(2)}`)
+            else if (name.includes('金额')) lines.push(`${name}: ${v.toFixed(4)}`)
             else if (name.includes('电压') || name.includes('电流')) lines.push(`${name}: ${v.toFixed(2)}`)
             else lines.push(`${name}: ${String(p.value)}`)
           }
@@ -1866,7 +1883,7 @@ const cmdFieldMeta: Record<string, Record<string, FieldMeta>> = {
     serviceFee: { name: '服务费费用', desc: '分辨率0.01元', decodedKey: 'serviceFee' },
     parkFee: { name: '停车费费用', desc: '分辨率0.01元', decodedKey: 'parkFee' },
     segmentCount: { name: '时间段数量N', desc: '1~20', decodedKey: 'segmentCount' },
-    batterySn: { name: '电池SN', desc: 'V2.24 为 27 字节；V2.25 为 17 字节（与 protocolId 相关）', decodedKey: 'batterySn', valueType: 'ascii' },
+    batterySn: { name: '电池SN', desc: 'V2.24 为 27 字节；V2.25 为 17 字节；0x23 推送时全 0 表示无电池数据', decodedKey: 'batterySn', valueType: 'ascii' },
   },
   '0x25': {
     timeTag: { name: '时间标识', desc: '报文时间戳', decodedKey: 'timeTag', valueType: 'timeTag6' },
@@ -1905,6 +1922,9 @@ const cmdFieldMeta: Record<string, Record<string, FieldMeta>> = {
     failReason: { name: '失败原因', desc: '时间段穿插/数量错误/格式错误/其他', decodedKey: 'failReason' },
   },
 }
+
+/** 0x33 历史充电记录与 0x23 字段布局一致（含电能/服务费 0.01 元分辨率） */
+cmdFieldMeta['0x33'] = cmdFieldMeta['0x23']
 
 function decodeU16LeFromHex(hex: string): number {
   const h = hex.replace(/[^0-9a-f]/gi, '')
@@ -2044,9 +2064,18 @@ function logFieldRows(entry: { command: string; structured: Record<string, unkno
           EleFee: '电费',
           SvcFee: '服务费',
         }
+        const segFieldDescMap: Record<string, string> = {
+          StartTime: '时段开始时间',
+          EndTime: '时段结束时间',
+          ElePrice: '分辨率0.0001元/kWh',
+          SvcPrice: '分辨率0.0001元/kWh',
+          Energy: '分辨率0.0001kWh',
+          EleFee: '分辨率0.01元',
+          SvcFee: '分辨率0.01元',
+        }
         return {
           name: `时段${segIdx} ${segFieldNameMap[suffix] ?? suffix}`,
-          desc: '0x25 时段循环字段',
+          desc: segFieldDescMap[suffix] ?? '0x25 时段循环字段',
           valueType: suffix === 'StartTime' || suffix === 'EndTime' ? ('timeTag6' as const) : undefined,
         }
       }
@@ -2416,6 +2445,7 @@ function confirmLinkCar() {
 
 function openAddDialog() {
   addForm.value = {
+    name: '',
     pileId: String(topologyStore.piles.length + 1).padStart(3, '0'),
     tcpHost: '127.0.0.1',
     tcpPort: 9000 + topologyStore.piles.length + 1,
@@ -2428,6 +2458,11 @@ function openAddDialog() {
 
 function confirmAddPile() {
   const data = addForm.value
+  const nameErr = validatePileName(data.name)
+  if (nameErr) {
+    ElMessage.warning(nameErr)
+    return
+  }
   if (!data.pileId.trim()) {
     ElMessage.warning('请输入桩号')
     return
@@ -2452,6 +2487,7 @@ function confirmAddPile() {
     topologyStore.addPile({
       protocolId: data.protocolId || protocolStore.activeProtocol.protocolId,
       pileId: data.pileId.trim(),
+      name: data.name.trim(),
       tcpHost: data.tcpHost.trim(),
       tcpPort: data.tcpPort,
       pilePowerKw: data.pilePowerKw,
@@ -2524,7 +2560,8 @@ function confirmAddPile() {
         </div>
       </div>
 
-      <section v-if="boardViewMode === 'topology'" class="jx-board">
+      <div class="jx-board-host">
+      <section v-show="boardViewMode === 'topology'" class="jx-board">
         <el-tooltip content="添加桩" placement="left">
           <button
             type="button"
@@ -2563,7 +2600,10 @@ function confirmAddPile() {
             :style="{ width: `${pileColumnWidth(pile.guns.length)}px` }"
           >
             <div class="jx-drop-up" aria-hidden="true" />
-            <div class="jx-pile-id-top">{{ pile.pileId }}</div>
+            <div class="jx-pile-label-top" :class="{ 'jx-pile-label-top--named': pileHasCustomName(pile) }">
+              <div class="jx-pile-name-top">{{ pileDisplayLabel(pile) }}</div>
+              <div class="jx-pile-id-top">{{ pile.pileId }}</div>
+            </div>
             <div class="jx-pile-wrap">
               <div class="jx-pile-left-info">
               <JxRatePopover
@@ -2734,7 +2774,7 @@ function confirmAddPile() {
 
       </section>
 
-      <section v-else class="jx-board jx-board--list">
+      <section v-show="boardViewMode === 'list'" class="jx-board jx-board--list">
         <JxBoardList
           :piles="visiblePiles"
           :active-pile-id="topologyStore.activePileId"
@@ -2764,9 +2804,10 @@ function confirmAddPile() {
           @update:vin-draft="(v) => (vinForm.vin = v)"
         />
       </section>
+      </div>
 
       <aside
-        v-if="drawerVisible"
+        v-show="drawerVisible"
         class="jx-panel"
         :class="{ 'jx-panel--list-mode': boardViewMode === 'list' }"
         :style="boardViewMode === 'topology' ? { left: drawerLeftStyle } : undefined"
@@ -2800,6 +2841,19 @@ function confirmAddPile() {
                 </svg>
               </button>
             </template>
+            <el-descriptions-item label="名称">
+              <el-input
+                v-if="basicEditing"
+                v-model="basicForm.name"
+                size="small"
+                class="jx-basic-inline-input"
+                :maxlength="JX_PILE_NAME_MAX_LEN"
+                show-word-limit
+                placeholder="可选，最多20字"
+                @keyup.enter="saveBasicInfo"
+              />
+              <span v-else>{{ topologyStore.activePile ? pileDisplayLabel(topologyStore.activePile) : '—' }}</span>
+            </el-descriptions-item>
             <el-descriptions-item label="桩号">
               <el-input
                 v-if="basicEditing"
@@ -3022,8 +3076,9 @@ function confirmAddPile() {
 
           <div v-else-if="selectedFlowId === 'scan-qr-vin-start'" class="jx-control-form">
             <p class="jx-flow-hint">
-              用户扫码后平台下发 <code>0x59</code>，模拟器回复 <code>0x5B</code> 并创建订单；成功后自动发送带订单号的
-              <code>0x40</code>，鉴权通过后与 VIN 启动一致（<code>0x21</code>→<code>0x22</code>）。与「扫码远程启动流程」（<code>0x1F</code>）互斥：请在本流程与远程扫码流程中二选一。
+              平台下发 <code>0x59</code> 时始终处理（无需先选本流程）：回复 <code>0x5B</code> 并创建订单；成功后自动发送带订单号的
+              <code>0x40</code>，鉴权通过后与 VIN 启动一致（<code>0x21</code>→<code>0x22</code>）。本面板仅用于配置
+              <code>0x5B</code> 模拟失败等应答。
             </p>
             <div class="jx-form-row">
               <span class="jx-form-label">0x5B 回复失败</span>
@@ -3303,6 +3358,14 @@ function confirmAddPile() {
 
       <el-dialog v-model="addDialogVisible" title="创建充电桩" width="460px" destroy-on-close>
         <el-form label-width="110px">
+          <el-form-item label="名称">
+            <el-input
+              v-model="addForm.name"
+              :maxlength="JX_PILE_NAME_MAX_LEN"
+              show-word-limit
+              placeholder="可选，最多20字"
+            />
+          </el-form-item>
           <el-form-item label="桩号">
             <el-input v-model="addForm.pileId" placeholder="例如 001" />
           </el-form-item>
@@ -3362,8 +3425,9 @@ function confirmAddPile() {
                   {{ qrDialogLoading ? '正在生成二维码…' : qrDialogText ? '未生成' : '暂无二维码，请确认登录后已下发枪二维码' }}
                 </div>
                 <p class="jx-start-scan-hint">
-                  扫码后平台通常下发 <code>0x1F</code>（账户/卡启动）或 <code>0x59</code>（VIN 启动）。请在侧栏流程控制中选择
-                  <strong>「扫码远程启动流程」</strong>或 <strong>「扫码VIN启动流程」</strong> 之一，并配置对应应答。
+                  本页二维码仅便于联调扫码；平台也可直接下发启动报文。收到 <code>0x59</code>（扫码 VIN）始终处理；收到
+                  <code>0x1F</code>（扫码远程）始终处理。侧栏流程面板可选，用于配置对应应答（如 <code>0x5B</code> /
+                  <code>0x21</code> 模拟失败）。
                 </p>
               </div>
             </el-tab-pane>
@@ -3597,8 +3661,8 @@ function confirmAddPile() {
                       <template v-if="seg.startTime && seg.endTime">{{ seg.startTime }} ~ {{ seg.endTime }}</template>
                       <template v-else>—</template>
                     </td>
-                    <td>{{ typeof seg.electricFeeYuan === 'number' ? seg.electricFeeYuan.toFixed(2) : '—' }}</td>
-                    <td>{{ typeof seg.serviceFeeYuan === 'number' ? seg.serviceFeeYuan.toFixed(2) : '—' }}</td>
+                    <td>{{ typeof seg.electricFeeYuan === 'number' ? seg.electricFeeYuan.toFixed(4) : '—' }}</td>
+                    <td>{{ typeof seg.serviceFeeYuan === 'number' ? seg.serviceFeeYuan.toFixed(4) : '—' }}</td>
                   </tr>
                 </tbody>
               </table>
@@ -3777,6 +3841,19 @@ function confirmAddPile() {
 
 .jx-mini-select { width: 112px; }
 
+.jx-board-host {
+  position: relative;
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+}
+
+.jx-board-host > .jx-board {
+  flex: 1;
+  min-height: 0;
+}
+
 .jx-board {
   position: relative;
   display: flex;
@@ -3873,14 +3950,33 @@ function confirmAddPile() {
 }
 .jx-pile-col { display: flex; flex-direction: column; align-items: center; position: relative; flex-shrink: 0; }
 .jx-drop-up { width: 2px; height: 22px; margin-bottom: 6px; background: var(--jx-teal); }
-.jx-pile-id-top {
+.jx-pile-label-top {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  max-width: min(140px, 100%);
+  margin-bottom: 4px;
+}
+.jx-pile-name-top {
   font-size: 11px;
-  font-weight: 700;
+  font-weight: 600;
+  line-height: 1.3;
+  word-break: break-all;
+  color: var(--jx-text);
+  margin-bottom: 2px;
+}
+.jx-pile-label-top:not(.jx-pile-label-top--named) .jx-pile-name-top {
+  color: var(--jx-muted);
+}
+.jx-pile-id-top {
+  font-size: 10px;
+  font-weight: 600;
   text-align: center;
   line-height: 1.3;
   word-break: break-all;
-  max-width: min(140px, 100%);
-  margin-bottom: 4px;
+  max-width: 100%;
+  color: var(--jx-pile-id, var(--jx-text-muted));
 }
 .jx-pile-left-info {
   position: absolute;

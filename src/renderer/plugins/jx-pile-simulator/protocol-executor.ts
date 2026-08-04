@@ -9,6 +9,7 @@ import {
   type JxChargeElectricalSample,
 } from './jx-charge-electrical-model'
 import { make21Payload } from './jx-wire-021'
+import { pileStatusAfterGunLeaveCharging } from './jx-gun-display'
 import { build025PayloadWire } from './jx-wire-025'
 import { build030PayloadWire } from './jx-wire-030'
 import { WIRE_SCALE } from './jx-wire-scale'
@@ -69,7 +70,7 @@ export type ScanQrVinStartRuntimeConfig = {
 
 const remoteStartConfigByPile = new Map<string, RemoteStartRuntimeConfig>()
 const scanQrVinStartConfigByPile = new Map<string, ScanQrVinStartRuntimeConfig>()
-/** 侧栏当前选中的监听流程：决定 0x59 是否走扫码 VIN 启动，0x1F 始终按远程启动处理 */
+/** 侧栏当前选中的监听流程（用于流程配置面板；0x59 / 0x1F 均始终可处理，不依赖选中） */
 const activeListenFlowByPile = new Map<string, string>()
 
 export function isScanQrVinListenFlow(flowId: string | null | undefined): boolean {
@@ -1886,23 +1887,6 @@ export function ensureTcpEventListener() {
       }
 
       if (normalizeCmd(cmd) === '0x59' && pile) {
-        const listenFlow = getActiveListenFlow(pileId)
-        if (!isScanQrVinListenFlow(listenFlow)) {
-          logs.appendLog(pileId, {
-            t: Date.now(),
-            pileId,
-            command: '0x59',
-            direction: 'receive',
-            remoteIp: remote,
-            rawHex: toHexPairs(String(evt.frameHex ?? '')),
-            structured: {
-              type: 'scan-qr-vin-start-ignored',
-              activeFlow: listenFlow,
-              detail: '当前未选择「扫码VIN启动流程」，忽略 0x59（请选用扫码远程启动流程等待 0x1F）',
-            },
-          })
-          return
-        }
         const body = (dataHex || '').replace(/[^0-9a-f]/gi, '').toLowerCase()
         const parsed59 = parseVinStart59Payload(body)
         const gunNoHex =
@@ -2467,7 +2451,9 @@ function stopHeartbeat(pileId: string) {
 export function disposeJxPileRuntime(pileId: string): void {
   stopHeartbeat(pileId)
   loginPending03State.delete(pileId)
-  pendingStartAck.delete(pileId)
+  for (const key of [...pendingStartAck.keys()]) {
+    if (key === pileId || key.startsWith(`${pileId}:`)) pendingStartAck.delete(key)
+  }
   remoteStartConfigByPile.delete(pileId)
   scanQrVinStartConfigByPile.delete(pileId)
   activeListenFlowByPile.delete(pileId)
@@ -3041,16 +3027,29 @@ async function runScanQrVinAuthContinuation(
   dispatchVinAuth21After41(pile, pileId, gunId, orderNo, true, parsed, remote)
 }
 
-/** 判断订单是否为当前枪上正在进行的充电会话（与 `pendingStartAck` / 0x25 推送定时器一致） */
+/** 判断订单是否为当前枪上正在进行的充电会话（pending / 0x25 定时器 / 订单与枪充电态） */
 export function isGunOrderLiveSession(
   orderNo: string,
   pendingOrderNo: string | undefined,
   hasChargeTimer: boolean,
   gunStatus: string,
+  orderStatus?: string,
 ): boolean {
-  if (!pendingOrderNo || pendingOrderNo !== orderNo) return false
-  if (hasChargeTimer) return true
-  return gunStatus === 'charging'
+  if (pendingOrderNo === orderNo) {
+    if (hasChargeTimer) return true
+    if (gunStatus === 'charging') return true
+    /** 已上送 0x21、等待 0x22 */
+    if (orderStatus === 'starting' || orderStatus === 'start-accepted') return true
+    return false
+  }
+  /** pending 指向其它订单时，本单不是当前会话 */
+  if (pendingOrderNo && pendingOrderNo !== orderNo) return false
+  /**
+   * pending 丢失（页面刷新等）：订单与枪仍为充电中，或仍有 0x25 定时器时，视为活跃会话，
+   * 以便「强制结束」能重置枪状态并清理实时数据。
+   */
+  if (orderStatus === 'charging' && (gunStatus === 'charging' || hasChargeTimer)) return true
+  return false
 }
 
 export function isLiveChargingOrder(pileId: string, orderNo: string): boolean {
@@ -3061,11 +3060,54 @@ export function isLiveChargingOrder(pileId: string, orderNo: string): boolean {
   const key = `${pileId}:${order.gunId}`
   const pending = pendingStartAck.get(key)
   const gun = topo.piles.find((x) => x.pileId === pileId)?.guns.find((g) => g.gunId === order.gunId)
-  return isGunOrderLiveSession(orderNo, pending?.orderNo, chargingInfoTimers.has(key), gun?.status ?? 'idle')
+  return isGunOrderLiveSession(
+    orderNo,
+    pending?.orderNo,
+    chargingInfoTimers.has(key),
+    gun?.status ?? 'idle',
+    order.status,
+  )
 }
 
 /**
- * 强制完成非当前充电会话的订单：仅更新订单状态并上送 0x23，不停止桩/枪正在进行的其它充电。
+ * 结束订单时释放该枪充电会话：停 0x25、清 pending、枪回到「链接」并清 SOC。
+ * 不影响其它枪，也不影响同枪上其它仍活跃的订单。
+ */
+function releaseGunChargeSession(pileId: string, order: JxPileOrder): void {
+  const orderStore = useJxOrderStore()
+  const topo = useJxTopologyStore()
+  const key = `${pileId}:${order.gunId}`
+  const pending = pendingStartAck.get(key)
+
+  const otherActiveOnGun = orderStore.listByPile(pileId).some(
+    (o) =>
+      o.gunId === order.gunId &&
+      o.orderNo !== order.orderNo &&
+      (o.status === 'charging' || o.status === 'starting' || o.status === 'start-accepted'),
+  )
+
+  if (pending?.orderNo === order.orderNo) {
+    stop25Push(pileId, order.gunId)
+    pendingStartAck.delete(key)
+  } else if (!pending && !otherActiveOnGun) {
+    stop25Push(pileId, order.gunId)
+  }
+
+  if (otherActiveOnGun) return
+
+  const pile = topo.piles.find((x) => x.pileId === pileId)
+  const gun = pile?.guns.find((g) => g.gunId === order.gunId)
+  if (!pile || !gun) return
+  if (gun.status !== 'charging' && gun.status !== 'occupied') return
+
+  topo.applyStatePatch(pileId, {
+    status: pileStatusAfterGunLeaveCharging(pile.guns, order.gunId),
+    gunPatch: { gunId: order.gunId, status: 'linked', soc: undefined },
+  })
+}
+
+/**
+ * 强制完成订单：更新订单状态并上送 0x23；若该单仍占用枪位充电态则一并释放会话。
  */
 export function forceCompleteOrder(
   pileId: string,
@@ -3076,6 +3118,7 @@ export function forceCompleteOrder(
   const orderStore = useJxOrderStore()
   const order = orderStore.listByPile(pileId).find((x) => x.orderNo === orderNo)
   if (!order) return
+  releaseGunChargeSession(pileId, order)
   orderStore.updateOrderStatus(pileId, orderNo, {
     status: 'stopped',
     failReasonCode: reasonCode,
@@ -3090,21 +3133,10 @@ export function forceStopOrderCharging(
   reasonText = '急停按下',
   reasonCode = 1007,
 ): void {
-  if (!isLiveChargingOrder(pileId, orderNo)) {
-    forceCompleteOrder(pileId, orderNo, '充电完成', 1000)
-    return
-  }
-  const topo = useJxTopologyStore()
   const orderStore = useJxOrderStore()
   const order = orderStore.listByPile(pileId).find((x) => x.orderNo === orderNo)
   if (!order) return
-  const key = `${pileId}:${order.gunId}`
-  stop25Push(pileId, order.gunId)
-  pendingStartAck.delete(key)
-  topo.applyStatePatch(pileId, {
-    status: 'idle',
-    gunPatch: { gunId: order.gunId, status: 'linked', soc: undefined },
-  })
+  releaseGunChargeSession(pileId, order)
   orderStore.updateOrderStatus(pileId, orderNo, {
     status: 'stopped',
     failReasonCode: reasonCode,

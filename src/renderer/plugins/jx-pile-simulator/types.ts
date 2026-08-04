@@ -100,6 +100,8 @@ export type JxImportResult = JxImportOk | JxImportErr
 
 export interface JxTopologyPile {
   pileId: string
+  /** 自定义桩名称（展示用，≤20 字） */
+  name?: string
   /** 绑定协议（如 `jx-v2.24-core` / `jx-v2.25-core`）；决定 `0x23` 等线格式与电量分辨率；`0x21` 起始电量见 `cm21StartElect*`（与服务端共用） */
   protocolId: string
   /** 设备类型（用于筛选展示，默认直流） */
@@ -260,8 +262,11 @@ export interface JxPileOrder {
     stopReason?: number
     billingModelSelect?: number
     modelVersion?: number
+    /** 电能费用，报文分辨率 0.01 元整数（CovertConst.TWO_POINT） */
     electricFee?: number
+    /** 服务费费用，报文分辨率 0.01 元整数（CovertConst.TWO_POINT） */
     serviceFee?: number
+    /** 停车费，报文分辨率 0.01 元整数 */
     parkFee?: number
     segmentCount?: number
     segments?: Array<{

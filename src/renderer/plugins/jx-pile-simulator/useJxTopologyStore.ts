@@ -1,6 +1,7 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import type { JxTopologyPile } from './types'
+import { normalizePileName } from './jx-pile-display'
 
 const STORAGE_KEY = 'jx-topology-piles-v1'
 
@@ -12,6 +13,7 @@ function buildDefaultPile(protocolId: string, seq: number, gunCount = 2): JxTopo
   const pileId = String(seq).padStart(3, '0')
   return {
     pileId,
+    name: undefined,
     protocolId,
     deviceKind: seq % 2 === 1 ? 'dc' : 'ac',
     tcpHost: '127.0.0.1',
@@ -35,6 +37,7 @@ function normalizePile(input: JxTopologyPile, fallbackProtocolId: string, idx: n
   const seq = idx + 1
   return {
     pileId: input.pileId || String(seq).padStart(3, '0'),
+    name: normalizePileName(input.name),
     protocolId: input.protocolId || fallbackProtocolId,
     deviceKind: input.deviceKind ?? (seq % 2 === 1 ? 'dc' : 'ac'),
     tcpHost: input.tcpHost ?? '127.0.0.1',
@@ -132,7 +135,7 @@ export const useJxTopologyStore = defineStore('jx-topology', () => {
     const q = keyword.value.trim().toLowerCase()
     if (!q) return piles.value
     return piles.value.filter((p) =>
-      [p.pileId, ...p.guns.map((g) => g.gunId), ...p.guns.map((g) => g.vin ?? ''), ...p.guns.map((g) => g.lastVin ?? '')]
+      [p.pileId, p.name ?? '', ...p.guns.map((g) => g.gunId), ...p.guns.map((g) => g.vin ?? ''), ...p.guns.map((g) => g.lastVin ?? '')]
         .join('|')
         .toLowerCase()
         .includes(q),
@@ -144,6 +147,7 @@ export const useJxTopologyStore = defineStore('jx-topology', () => {
   function addPile(payload: {
     protocolId: string
     pileId: string
+    name?: string
     tcpHost: string
     tcpPort: number
     gunCount: number
@@ -153,6 +157,7 @@ export const useJxTopologyStore = defineStore('jx-topology', () => {
     if (exists) throw new Error('桩号已存在')
     const next = buildDefaultPile(payload.protocolId, piles.value.length + 1, payload.gunCount)
     next.pileId = payload.pileId
+    next.name = normalizePileName(payload.name)
     next.tcpHost = payload.tcpHost
     next.tcpPort = payload.tcpPort
     next.onlineState = 'offline'
@@ -181,7 +186,7 @@ export const useJxTopologyStore = defineStore('jx-topology', () => {
 
   function updatePileBasic(
     pileId: string,
-    patch: Partial<Pick<JxTopologyPile, 'pileId' | 'protocolId' | 'tcpHost' | 'tcpPort' | 'pilePowerKw'>>,
+    patch: Partial<Pick<JxTopologyPile, 'pileId' | 'name' | 'protocolId' | 'tcpHost' | 'tcpPort' | 'pilePowerKw'>>,
   ) {
     const pile = piles.value.find((x) => x.pileId === pileId)
     if (!pile) throw new Error('未找到桩')
@@ -192,6 +197,10 @@ export const useJxTopologyStore = defineStore('jx-topology', () => {
       if (exists) throw new Error('桩号已存在')
       pile.pileId = nextPileId
       if (activePileId.value === pileId) activePileId.value = nextPileId
+    }
+
+    if ('name' in patch) {
+      pile.name = normalizePileName(patch.name)
     }
 
     if (typeof patch.protocolId === 'string' && patch.protocolId.trim()) {
@@ -232,16 +241,10 @@ export const useJxTopologyStore = defineStore('jx-topology', () => {
     const pile = piles.value.find((x) => x.pileId === pileId)
     if (!pile) return
     const wasPileCharging = pile.status === 'charging'
-    if (patch.status) pile.status = patch.status
     if (patch.onlineState) pile.onlineState = patch.onlineState
     if (typeof patch.allowTimeoutCount === 'number') pile.allowTimeoutCount = patch.allowTimeoutCount
     if (typeof patch.heartbeatIntervalSec === 'number') pile.heartbeatIntervalSec = patch.heartbeatIntervalSec
     if (patch.tariffModel !== undefined) pile.tariffModel = patch.tariffModel
-    if (patch.status && wasPileCharging && patch.status !== 'charging') {
-      for (const g of pile.guns) {
-        g.soc = undefined
-      }
-    }
     if (patch.gunPatch?.gunId) {
       const gun = pile.guns.find((g) => g.gunId === patch.gunPatch?.gunId)
       if (gun) {
@@ -250,6 +253,13 @@ export const useJxTopologyStore = defineStore('jx-topology', () => {
         if (wasGunCharging && gun.status !== 'charging' && patch.gunPatch.soc === undefined) {
           gun.soc = undefined
         }
+      }
+    }
+    if (patch.status) pile.status = patch.status
+    /** 桩离开 charging 时，只清非充电枪 SOC，避免双枪同充停一枪牵连另一枪 */
+    if (patch.status && wasPileCharging && patch.status !== 'charging') {
+      for (const g of pile.guns) {
+        if (g.status !== 'charging') g.soc = undefined
       }
     }
     persist()

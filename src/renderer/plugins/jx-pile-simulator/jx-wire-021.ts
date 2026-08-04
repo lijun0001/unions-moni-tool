@@ -42,6 +42,21 @@ function u32LeHex(n: number): string {
     .join('')
 }
 
+/** 解析 `0x21` 用 VIN：优先订单鉴权 VIN，其次枪位当前/最近 VIN。 */
+export function resolve021Vin(pile: JxTopologyPile | undefined, order: JxPileOrder | undefined): string {
+  const fromOrder = String(order?.request23?.vin ?? '').trim()
+  if (fromOrder) return fromOrder.toUpperCase().slice(0, 17)
+  const gun = order && pile ? pile.guns.find((g) => g.gunId === order.gunId) : undefined
+  const fromGun = String(gun?.vin ?? gun?.lastVin ?? '').trim()
+  if (fromGun) return fromGun.toUpperCase().slice(0, 17)
+  const src = order?.startAuthSource
+  if (src === '0x40-vin' || src === '0x59-scan-vin') {
+    const fromUserId = String(order?.request23?.userId ?? '').trim()
+    if (fromUserId) return fromUserId.toUpperCase().slice(0, 17)
+  }
+  return ''
+}
+
 export function resolve021UserExtras(
   pile: JxTopologyPile | undefined,
   order: JxPileOrder | undefined,
@@ -53,8 +68,8 @@ export function resolve021UserExtras(
     return { userType: Math.max(0, Math.min(0xffff, ut)), userId: order.request23?.userId ?? '' }
   }
   if (src === '0x40-vin' || src === '0x59-scan-vin') {
-    const gun = pile?.guns.find((g) => g.gunId === order.gunId)
-    return { userType: 6, userId: gun?.vin ?? '' }
+    const vin = resolve021Vin(pile, order)
+    return { userType: 6, userId: vin || order.request23?.userId || '' }
   }
   const ut = order.request23?.userType
   const n = typeof ut === 'number' && Number.isFinite(ut) ? Math.trunc(ut) : 0
@@ -64,10 +79,11 @@ export function resolve021UserExtras(
 /**
  * 直流桩 `0x21` 表-3.9.7 序号 16～39：与 `CM21Data` 反射字段顺序一致（68 字节）。
  * BCP-SOC：服务端按 `ONE_POINT`（0.1）换算；此处送 `SOC(%)×10` 无符号整型。
+ * BRM-VIN：写入会话 VIN（订单/枪位）。
  */
 function make021DcTailHex(pile: JxTopologyPile, order: JxPileOrder | undefined): string {
   const gun = order ? pile.guns.find((g) => g.gunId === order.gunId) : undefined
-  const vin = gun?.vin ?? ''
+  const vin = resolve021Vin(pile, order)
   const socTenths =
     typeof gun?.soc === 'number' && Number.isFinite(gun.soc)
       ? Math.max(0, Math.min(1000, Math.round(gun.soc * 10)))
